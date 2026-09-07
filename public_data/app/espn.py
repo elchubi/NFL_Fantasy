@@ -38,12 +38,15 @@ PRACTICE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("full", re.compile(r"\bfull (?:participant|practice|go)\b", re.I)),
 )
 
-# ESPN's site API is unofficial and appears to reject requests carrying an
-# obviously non-browser User-Agent (this app's own default is a clearly
-# labelled bot string, which is honest but got a live 403 from ESPN
-# specifically - Sleeper, nflverse, The Odds API and Open-Meteo have all been
-# fine with it). A realistic browser UA only for these calls is the practical
-# fix; every other source keeps the honest one.
+# ESPN's site API is unofficial and rejects every request from this app's
+# Railway deployment with a 403 (Sleeper, nflverse, The Odds API and
+# Open-Meteo have all been fine). A realistic browser User-Agent was tried
+# first and did not help - confirmed live, the block persisted identically
+# after that fix shipped - so this is most likely an IP-range block on
+# Railway's outbound traffic rather than anything about the request itself.
+# Kept anyway since it can't hurt and might matter for some endpoints; the
+# real fix is `allow_403` below, which lets these calls degrade to
+# `source_available: false` instead of taking the whole endpoint down.
 _BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -123,6 +126,7 @@ class EspnProvider:
             timeout=self._settings.http_timeout,
             max_retries=self._settings.http_max_retries,
             allow_404=True,
+            allow_403=True,
         )
         if payload is None:
             return {"games": [], "source_available": False}
@@ -138,6 +142,7 @@ class EspnProvider:
             timeout=self._settings.http_timeout,
             max_retries=self._settings.http_max_retries,
             allow_404=True,
+            allow_403=True,
         )
         if payload is None:
             return {"injuries": [], "source_available": False}

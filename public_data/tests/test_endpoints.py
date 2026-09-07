@@ -37,20 +37,20 @@ async def fake_sleeper_get(self, url, params=None, timeout=None):
     return Resp()
 
 
-def test_health_needs_no_api_key():
+def test_health_needs_no_api_key(monkeypatch):
     import httpx
 
-    httpx.AsyncClient.get = fake_sleeper_get
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_sleeper_get)
     with TestClient(main.app) as client:
         response = client.get("/health")
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
 
 
-def test_players_endpoint_serves_the_trimmed_map():
+def test_players_endpoint_serves_the_trimmed_map(monkeypatch):
     import httpx
 
-    httpx.AsyncClient.get = fake_sleeper_get
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_sleeper_get)
     with TestClient(main.app) as client:
         h = {"X-API-Key": "test-key"}
         response = client.get("/players", headers=h)
@@ -69,10 +69,10 @@ def test_players_endpoint_requires_the_api_key():
         assert client.get("/players").status_code == 401
 
 
-def test_advanced_stats_404s_for_a_player_with_no_gsis_id():
+def test_advanced_stats_404s_for_a_player_with_no_gsis_id(monkeypatch):
     import httpx
 
-    httpx.AsyncClient.get = fake_sleeper_get
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_sleeper_get)
     with TestClient(main.app) as client:
         h = {"X-API-Key": "test-key"}
         response = client.get("/advanced-stats/does-not-exist", headers=h)

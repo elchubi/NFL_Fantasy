@@ -10,8 +10,12 @@ os.environ.setdefault("API_KEY", "test-key")
 
 import pytest  # noqa: E402
 
+import httpx  # noqa: E402
+from fastapi import HTTPException  # noqa: E402
+
 from app import espn, nflverse, odds, weather  # noqa: E402
 from app.cache import KeyedDiskCache  # noqa: E402
+from app.http import request_json  # noqa: E402
 from app.teams import STADIUMS, nfl_team_abbr, normalise_abbr  # noqa: E402
 from tests import fixtures_external as fx  # noqa: E402
 
@@ -282,6 +286,30 @@ def test_scoreboard_is_normalised_to_home_away_pairs():
     assert games[0]["week"] == 2
     assert games[1]["home_team"] == "MIN"
     assert espn.parse_scoreboard({}) == []
+
+
+async def test_a_403_with_allow_403_degrades_to_none_instead_of_raising():
+    # Confirmed live: ESPN's site API 403s every request from this app's
+    # Railway deployment, unrelated to headers or credentials. A source known
+    # to do this passes allow_403 so callers can degrade to
+    # source_available: false instead of the whole endpoint failing.
+    transport = httpx.MockTransport(lambda request: httpx.Response(403))
+    async with httpx.AsyncClient(transport=transport) as client:
+        result = await request_json(
+            client, "https://site.api.espn.com/whatever", source="ESPN", allow_403=True
+        )
+    assert result is None
+
+
+async def test_a_403_without_allow_403_still_raises():
+    # Every other source (no ESPN-style confirmed IP block) keeps failing
+    # loudly on a 401/403, since that usually means a real misconfiguration
+    # (e.g. a bad API key) worth surfacing rather than hiding.
+    transport = httpx.MockTransport(lambda request: httpx.Response(401))
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(HTTPException) as exc_info:
+            await request_json(client, "https://api.the-odds-api.com/whatever", source="The Odds API")
+    assert exc_info.value.status_code == 502
 
 
 # --- Weather ------------------------------------------------------------------

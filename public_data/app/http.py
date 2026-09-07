@@ -38,8 +38,18 @@ async def request_json(
     timeout: float | None = None,
     max_retries: int = 3,
     allow_404: bool = False,
+    allow_403: bool = False,
 ) -> Any:
-    """GET `url` and decode JSON, retrying transient failures."""
+    """GET `url` and decode JSON, retrying transient failures.
+
+    `allow_403` is for a source known to reject Railway's outbound traffic
+    outright (confirmed live for ESPN's site API - a browser User-Agent did
+    not help, so this is most likely an IP-range block rather than anything
+    in the request itself). Treating it like a 404 - return None instead of
+    raising - lets the caller degrade to `source_available: false` the same
+    way it already does for "no data", rather than hard-failing every
+    endpoint that touches this source.
+    """
     last_error: Exception | None = None
 
     for attempt in range(1, max(1, max_retries) + 1):
@@ -57,14 +67,20 @@ async def request_json(
                     return None
                 raise HTTPException(status_code=404, detail=f"{source} has no data at {url}.")
             if response.status_code in (401, 403):
+                if allow_403:
+                    log.warning(
+                        "[%s] %s rejected the request (%s); treating as unavailable.",
+                        source,
+                        url,
+                        response.status_code,
+                    )
+                    return None
                 raise HTTPException(
                     status_code=502,
                     detail=(
                         f"{source} rejected the request ({response.status_code}). "
                         "If this source needs an API key, check it; otherwise the "
-                        "source is likely flagging the request as automated (a "
-                        "missing or non-browser User-Agent is the usual cause for "
-                        "an unofficial API like ESPN's)."
+                        "source is likely flagging the request as automated."
                     ),
                 )
             if response.status_code in RETRY_STATUS:

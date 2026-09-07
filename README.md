@@ -1095,6 +1095,32 @@ no current `nfl_team` on file, after live testing turned up Tyreek Hill with `st
 surgery note - a real signal already present in Sleeper's own data, not a guess, which is
 why this one was implemented and the season-age heuristic above was not.
 
+### Known gap: ESPN's site API 403s every request from Railway
+
+Confirmed live: `site.api.espn.com` returns `403 Forbidden` for every request this app's
+Railway deployment makes to it, including the schedule/scoreboard endpoint that
+`/weather/{week}` depends on for its list of games. The first fix attempted was a
+realistic browser `User-Agent` (`espn.py`'s `_BROWSER_HEADERS`), on the theory that ESPN's
+unofficial API was flagging the app's honest bot User-Agent - it did not help; the 403
+persisted identically after that shipped and redeployed (same error, confirmed against
+Railway's deploy logs showing the new commit running). That rules out the request itself
+and points to an IP-range block on Railway's outbound traffic instead, which is not
+something a header change can fix. A VPN or consumer proxy was considered and rejected:
+most run into the same problem (VPN exit IPs are commonly blocked for exactly this reason),
+and running one inside a Railway container needs `NET_ADMIN`/`/dev/net/tun` access that a
+managed container platform does not grant. A paid rotating-residential-proxy service would
+likely work, but is an ongoing cost and a new piece of infrastructure for what is currently
+a "nice to have" (ESPN's practice-participation detail on top of what Sleeper's own
+`injury_status` already provides), so it was not built.
+
+The actual fix: `request_json` takes an `allow_403` flag (`public_data/app/http.py`) that,
+for a source confirmed to reject Railway's traffic outright, returns `None` instead of
+raising - the same treatment a 404 already gets. Both of `EspnProvider`'s call sites pass
+`allow_403=True`, so `team_report()` and `schedule()` degrade to `source_available: false`
+(and `/weather/{week}` to `available: false`) instead of a 502 taking down the whole
+endpoint. Every other source keeps failing loudly on a 401/403, since for them it usually
+means a real misconfiguration (a bad API key) worth surfacing, not hiding.
+
 ## How it behaves against Sleeper
 
 - **Player file**: fetched at most once per `PLAYERS_CACHE_TTL_HOURS` (20h by default),
