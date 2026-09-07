@@ -18,6 +18,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app import __version__, enrichment, services
 from app.config import get_settings
 from app.espn import EspnProvider
+from app.history import SOURCES as HISTORY_SOURCES
+from app.history import HistoryStore, capture_week
 from app.http import build_client
 from app.nflverse import NflverseProvider, require_gsis
 from app.odds import OddsProvider
@@ -46,6 +48,10 @@ espn = EspnProvider(external_http)
 weather = WeatherProvider(external_http)
 
 PROVIDERS = {"nflverse": nflverse, "odds": odds, "espn": espn, "weather": weather}
+
+# Append-only archive for betting lines and injury reports - the only two
+# sources that cannot be re-fetched from upstream once the week has passed.
+history = HistoryStore(settings.history_path())
 
 
 @asynccontextmanager
@@ -390,6 +396,126 @@ async def weather_for_week(
 async def stadiums() -> dict[str, Any]:
     """Coordinates and roof type per team - useful for checking the dome list."""
     return {"count": len(STADIUMS), "stadiums": all_stadiums()}
+
+
+@app.post(
+    "/capture",
+    tags=["history"],
+    dependencies=[Depends(require_api_key)],
+    summary="Archive this week's betting lines and injury reports",
+)
+async def capture(
+    week: int | None = Query(
+        default=None, ge=1, le=22, description="Week to capture. Defaults to the current week."
+    ),
+    season: int | None = Query(default=None, ge=1999, le=2100),
+    teams: str | None = Query(
+        default=None,
+        description=(
+            "Comma-separated NFL team abbreviations. Defaults to all 32, which is "
+            "what makes the archive complete rather than only covering your roster."
+        ),
+    ),
+    refresh: bool = Query(
+        default=True,
+        description=(
+            "Bypass the read caches so the archived line is the one live right now. "
+            "Costs one Odds API call per capture."
+        ),
+    ),
+) -> dict[str, Any]:
+    """Write this week's odds and injury reports to the append-only archive.
+
+    Meant to be called from a scheduler (Coolify cron), typically once on
+    Thursday and once shortly before Sunday kickoff. Rows identical to the last
+    recorded state are skipped, so calling it more often than the lines move
+    costs nothing but still captures every real change.
+    """
+    target_season = season or await current_season()
+    target_week = week or await current_week_number()
+
+    if teams:
+        requested = [normalise_abbr(t) for t in teams.split(",") if t.strip()]
+        unknown = [t for t, raw in zip(requested, teams.split(",")) if t is None]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown team abbreviation(s) in '{teams}'.",
+            )
+        team_list = [t for t in requested if t]
+    else:
+        team_list = sorted(STADIUMS)
+
+    return await capture_week(
+        history,
+        odds_provider=odds,
+        espn_provider=espn,
+        season=target_season,
+        week=target_week,
+        teams=team_list,
+        refresh=refresh,
+    )
+
+
+@app.get(
+    "/history",
+    tags=["history"],
+    dependencies=[Depends(require_api_key)],
+    summary="What is in the archive",
+)
+async def history_inventory() -> dict[str, Any]:
+    """Rows, weeks and file sizes per source and season."""
+    return {
+        "directory": settings.history_path(),
+        "sources": list(HISTORY_SOURCES),
+        "archived": history.inventory(),
+        "note": (
+            "Only odds and injury reports are archived. nflverse, Sleeper and "
+            "Open-Meteo keep their own history upstream and are re-fetched on demand."
+        ),
+    }
+
+
+@app.get(
+    "/history/{source}",
+    tags=["history"],
+    dependencies=[Depends(require_api_key)],
+    summary="Read archived rows for one source",
+)
+async def history_rows(
+    source: str = Path(description=f"One of: {', '.join(HISTORY_SOURCES)}."),
+    season: int | None = Query(default=None, ge=1999, le=2100),
+    week: int | None = Query(default=None, ge=1, le=22),
+    limit: int | None = Query(
+        default=None, ge=1, le=10000, description="Return only the most recent N rows."
+    ),
+) -> dict[str, Any]:
+    """Every recorded state for a source, oldest first.
+
+    A subject appears more than once when it actually changed - a line that
+    moved, or a player who went from limited to full participation - so the
+    sequence is the history, not just the latest value.
+    """
+    if source not in HISTORY_SOURCES:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown history source '{source}'. Valid: {', '.join(HISTORY_SOURCES)}.",
+        )
+    target_season = season or await current_season()
+    rows = history.read(source, target_season, week=week, limit=limit)
+    return {
+        "source": source,
+        "season": target_season,
+        "week": week,
+        "count": len(rows),
+        "rows": rows,
+    }
+
+
+async def current_week_number() -> int:
+    """The week Sleeper considers current."""
+    state = await client.nfl_state()
+    return services.current_week(state)
 
 
 async def current_season() -> int:

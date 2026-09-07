@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     espn_base_url: str = "https://site.api.espn.com/apis/site/v2/sports/football/nfl"
     espn_cache_ttl_hours: float = 3.0
 
+    # Append-only archive for the sources that cannot be re-fetched later.
+    # Empty means "history/ under the cache directory".
+    history_dir: str = ""
+
     # Open-Meteo (no key).
     weather_base_url: str = "https://api.open-meteo.com/v1/forecast"
     weather_cache_ttl_hours: float = 12.0
@@ -67,6 +71,15 @@ class Settings(BaseSettings):
 
         base = Path(self.cache_dir) if self.cache_dir else Path(self.players_cache_path).parent
         return str(base / filename)
+
+    def history_path(self) -> str:
+        """Directory holding the append-only JSONL archive."""
+        from pathlib import Path
+
+        if self.history_dir:
+            return self.history_dir
+        base = Path(self.cache_dir) if self.cache_dir else Path(self.players_cache_path).parent
+        return str(base / "history")
 
 
 @lru_cache

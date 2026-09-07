@@ -27,6 +27,9 @@ player file on disk.
 | `GET` | `/injury-report?team={abbr}` | `X-API-Key` | ESPN injury report for a whole team |
 | `GET` | `/weather/{week}` | `X-API-Key` | Kickoff weather for the week's outdoor venues |
 | `GET` | `/stadiums` | `X-API-Key` | The static stadium/dome reference used for weather |
+| `POST` | `/capture` | `X-API-Key` | Archive this week's betting lines and injury reports |
+| `GET` | `/history` | `X-API-Key` | What is in the archive, per source and season |
+| `GET` | `/history/{source}` | `X-API-Key` | Read archived rows (`odds` or `injuries`) |
 | `GET` | `/docs` | none (schema only) | Interactive OpenAPI docs |
 
 ### `GET /snapshot`
@@ -277,6 +280,81 @@ missing odds key or an ESPN outage costs you that block and nothing else:
 An unknown `include` value is rejected with `400` and the list of valid ones rather than
 being silently ignored.
 
+## Keeping history
+
+The league runs for years; the caches above do not. They are overwritten on every
+refresh, so the question is what would actually be lost.
+
+**Three of the five sources lose nothing.** They keep their own history upstream and are
+re-fetched on demand:
+
+| Source | Still available later? | |
+| --- | --- | --- |
+| nflverse | Yes | A file per season, back to 1999 for play-by-play. **Verified: 2018-2025 all resolve** |
+| Sleeper | Yes | Past seasons chain through `previous_league_id`; past weeks stay queryable |
+| Open-Meteo | Yes | Free historical archive API |
+| **The Odds API** | **No** | The free tier only returns upcoming games. A closing line is gone once the game kicks off (historical odds are a paid add-on) |
+| **ESPN injuries** | **No** | No historical endpoint exists. Wednesday's "limited" is overwritten by Thursday's "full", and after the week there is no record either happened |
+
+So this service archives **only the two that evaporate**. Re-storing the other three
+would duplicate public archives that are better maintained than anything kept here, and
+leave a schema to migrate for years.
+
+### `POST /capture`
+
+Writes the current week's betting lines and injury reports to an append-only
+[JSON Lines](https://jsonlines.org) file, one per source per season, under
+`HISTORY_DIR`. Query params: `week`, `season` (both default to current), `teams`
+(defaults to all 32) and `refresh` (default `true`).
+
+`refresh=true` bypasses the read caches so the archived line is the one live at capture
+time, rather than whatever a browsing request happened to warm the cache with hours
+earlier. That is the entire point of capturing on a schedule, so it defaults on and
+costs one Odds API call per capture.
+
+**A capture that would write a row identical to the last recorded state is skipped.** So
+running the cron more often than the lines move costs nothing, but every real change is
+kept:
+
+```
+08:33:23  DET@KC  spread=-9.0  total=50.0     <- Thursday
+08:41:07  DET@KC  spread=-7.5  total=50.0     <- Sunday, line moved
+
+08:33:23  SF  Christian McCaffrey  practice=did_not_practice   <- Wednesday
+08:41:07  SF  Christian McCaffrey  practice=limited            <- Friday
+```
+
+The sequence *is* the history: a subject appears again only when something about it
+actually changed.
+
+### Scheduling it
+
+Point a scheduler at the endpoint — Coolify's scheduled tasks, or any cron:
+
+```bash
+# Thursday evening and Sunday shortly before the early kickoffs
+curl -fsS -X POST -H "X-API-Key: $API_KEY" https://your-domain.example/capture
+```
+
+Twice a week for 18 weeks is ~36 Odds API calls a season, against a ~500/month free
+allowance. Storage runs roughly **250KB of odds and ~2MB of injuries per season** — the
+same `/data` volume covers it without going near needing a database engine.
+
+### Reading it back
+
+```bash
+curl -H "X-API-Key: $API_KEY" "https://your-domain.example/history"
+curl -H "X-API-Key: $API_KEY" "https://your-domain.example/history/odds?season=2025&week=2"
+curl -H "X-API-Key: $API_KEY" "https://your-domain.example/history/injuries?season=2025"
+```
+
+After a season or two this answers questions no API will: *how do my RBs score when the
+team is favoured by 7+?*, *do players listed limited on Wednesday actually play?*
+
+An interrupted write can leave a torn final line. The reader skips it with a warning
+instead of failing, and the next append starts on a fresh line so the damage stays
+confined to that one row.
+
 ## Authentication
 
 Every endpoint except `/health` requires the shared secret in a header:
@@ -309,6 +387,7 @@ required).
 | `ESPN_CACHE_TTL_HOURS` | no | `3` | How long injury reports are cached |
 | `WEATHER_CACHE_TTL_HOURS` | no | `12` | Forecast cache during the week |
 | `WEATHER_GAMEDAY_CACHE_TTL_HOURS` | no | `1` | Forecast cache once kickoff is within a day |
+| `HISTORY_DIR` | no | `<CACHE_DIR>/history` | Append-only archive of odds and injury reports |
 | `SLEEPER_BASE_URL` | no | `https://api.sleeper.app/v1` | Sleeper API base URL |
 | `HTTP_TIMEOUT` | no | `20` | Per-request timeout (seconds) for Sleeper calls |
 | `PLAYERS_HTTP_TIMEOUT` | no | `120` | Timeout for the ~5MB player file download |
@@ -369,8 +448,11 @@ pytest -q
 4. **Port** — the container listens on `8000`; Coolify's proxy maps it to your domain.
 5. **Healthcheck** — `GET /health` (unauthenticated, no upstream calls). Already wired
    into both the Dockerfile and the compose file.
-6. **Domain + HTTPS** — set your FQDN in Coolify and let it issue the certificate.
-7. Deploy, then verify:
+6. **Scheduled task** (optional, for the archive) — add a Coolify scheduled task running
+   `curl -fsS -X POST -H "X-API-Key: $API_KEY" http://localhost:8000/capture`, e.g.
+   Thursdays and Sundays. See [Keeping history](#keeping-history).
+7. **Domain + HTTPS** — set your FQDN in Coolify and let it issue the certificate.
+8. Deploy, then verify:
    ```bash
    curl https://your-domain.example/health
    curl -H "X-API-Key: <your key>" https://your-domain.example/league-settings
@@ -455,6 +537,7 @@ app/espn.py             ESPN injuries and schedule (defensive parsing)
 app/weather.py          Open-Meteo forecasts, domes short-circuited
 app/teams.py            Static stadium coordinates, roof types, name aliases
 app/enrichment.py       The optional ?include= blocks on /snapshot
+app/history.py          Append-only JSONL archive + the /capture flow
 tests/                  Offline tests against fixture payloads
 Dockerfile              Multi-stage build, non-root, healthcheck
 docker-compose.yml      Example deployment with a persistent cache volume
