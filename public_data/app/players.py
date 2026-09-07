@@ -19,6 +19,7 @@ from typing import Any
 from fastapi import HTTPException
 
 from app.config import get_settings
+from app.sleeper import SleeperClient
 
 log = logging.getLogger(__name__)
 
@@ -63,13 +64,7 @@ def _slim(player_id: str, raw: dict[str, Any]) -> dict[str, Any]:
 class PlayerStore:
     """Loads, caches and serves the player dictionary."""
 
-    def __init__(self, client: Any) -> None:
-        """`client` just needs an async `all_players()` returning a dict.
-
-        In this service that is `PublicDataClient` (see app/public_client.py) -
-        the shared public-data service, not Sleeper directly. The public-data
-        service itself uses this same class with its own `SleeperClient`.
-        """
+    def __init__(self, client: SleeperClient) -> None:
         settings = get_settings()
         self._client = client
         self._path = Path(settings.players_cache_path)

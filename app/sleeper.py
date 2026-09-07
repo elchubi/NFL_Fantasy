@@ -138,13 +138,3 @@ class SleeperClient:
         data = await self.get(f"/draft/{draft_id}/picks", allow_404=True)
         return data or []
 
-    async def all_players(self) -> dict[str, Any]:
-        """The ~5MB NFL player file. Call at most once a day (see PlayerStore)."""
-        settings = get_settings()
-        data = await self.get("/players/nfl", timeout=settings.players_http_timeout)
-        if not isinstance(data, dict) or not data:
-            raise HTTPException(
-                status_code=502,
-                detail="Sleeper returned an empty player file.",
-            )
-        return data

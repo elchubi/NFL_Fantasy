@@ -18,31 +18,18 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__, enrichment, services
 from app.config import get_settings
-from app.draft import DraftProvider, landing_spot, require_prospect
-from app.espn import EspnProvider
 from app.backfill import backfill_all, discover_chain
 from app.db import Database
 from app.history import SOURCES as HISTORY_SOURCES
-from app.history import (
-    auto_capture,
-    capture_week,
-    decision_row,
-    injury_rows,
-    odds_rows,
-    outcome_row,
-)
+from app.history import decision_row, outcome_row
 from app.managers import build_profiles
-from app.http import build_client
-from app.nflverse import NflverseProvider, require_gsis
-from app.odds import OddsProvider
 from app.players import PlayerStore
 from app.pressure import analyse_league
-from app.schedule import ScheduleProvider
+from app.public_client import PublicDataClient
 from app.security import require_api_key
 from app import store
 from app.sleeper import SleeperClient
 from app.teams import STADIUMS, normalise_abbr
-from app.weather import WeatherProvider, all_stadiums
 
 settings = get_settings()
 logging.basicConfig(
@@ -52,39 +39,21 @@ logging.basicConfig(
 log = logging.getLogger("sleeper-api")
 
 client = SleeperClient()
-players = PlayerStore(client)
 
-# One shared HTTP client for the external sources (nflverse, The Odds API,
-# ESPN, Open-Meteo). Sleeper keeps its own inside SleeperClient.
-external_http = build_client(settings.http_timeout)
-nflverse = NflverseProvider(external_http)
-odds = OddsProvider(external_http)
-espn = EspnProvider(external_http)
-weather = WeatherProvider(external_http)
-draft = DraftProvider(external_http)
-schedule = ScheduleProvider(external_http)
+# Player names, advanced stats, betting lines, injury reports, weather and the
+# draft board all live in the shared public-data service now - see
+# app/public_client.py and public_data/README.md. PlayerStore still keeps its
+# own local disk cache (so roster resolution stays a synchronous, in-memory
+# lookup); it is just hydrated from this client instead of from Sleeper
+# directly.
+public = PublicDataClient(
+    settings.public_data_url, settings.public_data_api_key, settings.public_data_timeout
+)
+players = PlayerStore(public)
 
-# The league's own history: transactions and draft picks across every season in
-# the chain, plus the betting lines and injury reports that cannot be re-fetched
-# once the week has passed.
+# The league's own history: transactions, draft picks and roster snapshots
+# across every season in the chain, plus the decision log.
 db = Database(settings.database_file())
-
-# Sources that keep a disk cache (warmed at startup).
-CACHED_PROVIDERS = {
-    "nflverse": nflverse,
-    "odds": odds,
-    "espn": espn,
-    "weather": weather,
-    "draft": draft,
-    "schedule": schedule,
-}
-
-# What the /snapshot blocks get. The history store rides along so those blocks
-# can archive whatever they pull fresh, the same as the read endpoints do.
-PROVIDERS = {
-    **CACHED_PROVIDERS,
-    "history": db if settings.history_auto_capture else None,
-}
 
 
 @asynccontextmanager
@@ -93,18 +62,19 @@ async def lifespan(app: FastAPI):
         log.warning("LEAGUE_ID is not set; league endpoints will return 503.")
     if not settings.api_key:
         log.warning("API_KEY is not set; protected endpoints will return 503.")
+    if not settings.public_data_api_key:
+        log.warning(
+            "PUBLIC_DATA_API_KEY is not set; every call to the public-data service "
+            "will fail with 503, including local player-name resolution."
+        )
     # Warm the in-memory copy from disk; the network refresh happens lazily on
-    # the first request so a cold Sleeper never blocks startup.
+    # the first request so a cold public-data service never blocks startup.
     players.load_from_disk()
-    for provider in CACHED_PROVIDERS.values():
-        provider.cache.load()
     # Opens the file and applies any pending migrations.
     log.info("Database ready: %s", db.stats())
-    if not settings.odds_api_key:
-        log.info("ODDS_API_KEY is not set; /odds will return 503 until it is.")
     yield
     await client.aclose()
-    await external_http.aclose()
+    await public.aclose()
     db.close()
 
 
@@ -138,18 +108,22 @@ def league_id() -> str:
 
 @app.get("/health", tags=["ops"], summary="Healthcheck for the platform")
 async def health() -> dict[str, Any]:
+    """This service's own liveness.
+
+    Deliberately does not call the public-data service, so this stays green
+    even when that dependency is down - the platform then knows this
+    container is fine and the problem is downstream. `health_check` (the
+    MCP tool) is the one that proves the whole chain works end to end.
+    """
     return {
         "status": "ok",
         "version": __version__,
         "league_id_configured": bool(settings.league_id),
         "api_key_configured": bool(settings.api_key),
         "players_cache": players.status(),
-        "sources": {
-            "sleeper": True,
-            "nflverse": True,
-            "odds_api": bool(settings.odds_api_key),
-            "espn": True,
-            "open_meteo": True,
+        "public_data": {
+            "url": settings.public_data_url,
+            "api_key_configured": bool(settings.public_data_api_key),
         },
     }
 
@@ -195,7 +169,7 @@ async def snapshot(
         week,
         days,
         includes=enrichment.parse_includes(include),
-        providers=PROVIDERS,
+        public=public,
     )
 
 
@@ -300,13 +274,11 @@ async def advanced_stats(
     Joined from the nflverse weekly releases on `gsis_id`, the id Sleeper
     carries on every player. Includes a season average, a last-three-week
     average and the delta between them - the earliest read on a role change.
+
+    Served by the shared public-data service, since none of this is specific
+    to this league.
     """
-    await players.ensure_fresh()
-    gsis = require_gsis(players, player_id)
-    target_season = season or await current_season()
-    result = await nflverse.for_gsis_id(gsis, target_season)
-    sleeper_player = players.resolve(player_id)
-    return {"player": sleeper_player, "gsis_id": gsis, **result}
+    return await public.get(f"/advanced-stats/{player_id}", params={"season": season})
 
 
 @app.get(
@@ -322,14 +294,11 @@ async def odds_for_week(
     """Spread, total, moneyline and who is favoured, per game.
 
     Cached for a day to protect the free tier's ~500 requests/month; the quota
-    The Odds API reports back is included in the response.
+    The Odds API reports back is included in the response. Served by the
+    shared public-data service, which also archives it there - not specific to
+    this league, and shared across every league that uses the same key.
     """
-    target_season = season or await current_season()
-    payload = await odds.for_week(week, target_season)
-    if settings.history_auto_capture and (payload.get("cache") or {}).get("refreshed"):
-        # Fresh from upstream, so this is a line state worth keeping.
-        await auto_capture(db, "odds", target_season, week, odds_rows(payload["games"]))
-    return payload
+    return await public.get(f"/odds/{week}", params={"season": season})
 
 
 @app.get(
@@ -345,9 +314,7 @@ async def injury_report_by_team(
 ) -> dict[str, Any]:
     """Every listed injury for a team, with practice participation when ESPN
     includes it in the note (full / limited / did_not_practice)."""
-    report = await espn.team_report(team)
-    await _archive_injuries(report)
-    return report
+    return await public.get("/injury-report", params={"team": team})
 
 
 @app.get(
@@ -364,51 +331,7 @@ async def injury_report_by_player(
     Matched on `espn_id` from the Sleeper player file, falling back to an exact
     name match within the player's own team.
     """
-    await players.ensure_fresh()
-    sleeper_player = players.resolve(player_id)
-    if not sleeper_player["resolved"]:
-        raise HTTPException(
-            status_code=404, detail=f"'{player_id}' is not a known Sleeper player id."
-        )
-
-    team = normalise_abbr(sleeper_player.get("nfl_team"))
-    if not team:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"{sleeper_player['name']} has no NFL team on file, so there is no "
-                "ESPN team report to look them up in."
-            ),
-        )
-
-    report = await espn.team_report(team)
-    await _archive_injuries(report)
-    espn_id = players.espn_id(player_id)
-    needle = " ".join(sleeper_player["name"].lower().split())
-
-    match = None
-    for item in report.get("injuries", []):
-        if espn_id and str(item.get("espn_id")) == espn_id:
-            match = item
-            break
-        if " ".join(str(item.get("name", "")).lower().split()) == needle:
-            match = item
-
-    return {
-        "player": sleeper_player,
-        "nfl_team": team,
-        "espn_id": espn_id,
-        "listed": match is not None,
-        "espn_report": match,
-        "sleeper_injury_status": sleeper_player.get("injury_status"),
-        "note": (
-            None
-            if match
-            else f"{sleeper_player['name']} is not on ESPN's injury report for {team}."
-        ),
-        "source_available": report.get("source_available"),
-        "cache": report.get("cache"),
-    }
+    return await public.get(f"/injury-report/{player_id}")
 
 
 @app.get(
@@ -426,9 +349,7 @@ async def weather_for_week(
     The week's fixtures come from ESPN's scoreboard; the forecast itself comes
     from Open-Meteo at the home stadium's coordinates.
     """
-    return await enrichment.weather_block(
-        espn, weather, week, season or await current_season()
-    )
+    return await public.get(f"/weather/{week}", params={"season": season})
 
 
 @app.get(
@@ -438,8 +359,12 @@ async def weather_for_week(
     summary="The static stadium reference used for weather",
 )
 async def stadiums() -> dict[str, Any]:
-    """Coordinates and roof type per team - useful for checking the dome list."""
-    return {"count": len(STADIUMS), "stadiums": all_stadiums()}
+    """Coordinates and roof type per team - useful for checking the dome list.
+
+    Pure static data with no upstream fetch, so it is served locally rather
+    than round-tripping to the public-data service.
+    """
+    return {"count": len(STADIUMS), "stadiums": {abbr: dict(meta) for abbr, meta in STADIUMS.items()}}
 
 
 @app.get(
@@ -628,7 +553,8 @@ async def pressure(
     roster_positions = league.get("roster_positions") or []
     teams = services.build_teams(users, rosters)
 
-    byes = await schedule.byes(season) if season else {}
+    byes_response = await public.get(f"/byes/{season}") if season else {}
+    byes = byes_response.get("byes") or {}
     resolved = [
         services.resolve_roster(r, teams.get(r.get("roster_id"), {}), roster_positions, players)
         for r in rosters
@@ -759,39 +685,13 @@ async def draft_class(
 ) -> dict[str, Any]:
     """Every skill-position pick with draft capital, age, combine and landing spot.
 
-    Built from nflverse's draft_picks and combine releases. draft_picks carries
-    `gsis_id`, so each prospect lines up with the Sleeper rosters in /snapshot.
+    Built from nflverse's draft_picks and combine releases, not specific to
+    this league, so served by the shared public-data service.
     """
-    data, meta = await draft.class_for(season)
-    prospects = list((data.get("prospects") or {}).values())
-
-    if position:
-        wanted = position.strip().upper()
-        prospects = [p for p in prospects if p["position"] == wanted]
-    if round_max:
-        prospects = [p for p in prospects if (p["draft"]["round"] or 99) <= round_max]
-
-    prospects.sort(key=lambda p: (p["draft"]["round"] or 99, p["draft"]["pick_in_round"] or 999))
-
-    if landing and prospects:
-        await players.ensure_fresh()
-        prior, _ = await nflverse.season_data(season - 1)
-        prospects = [
-            {**p, "landing_spot": landing_spot(p, prior, players)} for p in prospects
-        ]
-
-    return {
-        "season": season,
-        "count": len(prospects),
-        "counts": data.get("counts"),
-        "prospects": [_with_sleeper(p) for p in prospects],
-        "cache": meta,
-        "note": (
-            "Draft capital and age are the strongest rookie-season predictors; "
-            "landing_spot is computed from last season's snap counts and each "
-            "incumbent's current Sleeper team. No college data source is used."
-        ),
-    }
+    return await public.get(
+        f"/draft-class/{season}",
+        params={"position": position, "round_max": round_max, "landing": landing},
+    )
 
 
 @app.get(
@@ -807,56 +707,7 @@ async def prospect(
     ),
 ) -> dict[str, Any]:
     """One prospect's draft capital, combine numbers and landing spot."""
-    await players.ensure_fresh()
-
-    # Accept either id: gsis ids look like 00-00xxxxx.
-    gsis = player_id if player_id.startswith("00-0") else players.gsis_id(player_id)
-    if not gsis:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"'{player_id}' has no gsis_id in the Sleeper player file, so it "
-                "cannot be matched to a draft pick."
-            ),
-        )
-
-    target_season = season or await _draft_season_for(gsis)
-    data, meta = await draft.class_for(target_season)
-    found = require_prospect(data, gsis)
-
-    prior, _ = await nflverse.season_data(target_season - 1)
-    return {
-        "season": target_season,
-        "prospect": _with_sleeper({**found, "landing_spot": landing_spot(found, prior, players)}),
-        "cache": meta,
-    }
-
-
-async def _draft_season_for(gsis: str) -> int:
-    """Find which class a gsis_id belongs to, newest first."""
-    current = await current_season()
-    for candidate in range(current, current - 6, -1):
-        data, _ = await draft.class_for(candidate)
-        if gsis in (data.get("prospects") or {}):
-            return candidate
-    raise HTTPException(
-        status_code=404,
-        detail=(
-            f"No skill-position pick in the last six draft classes matches {gsis}. "
-            "Pass ?season= to check an older class."
-        ),
-    )
-
-
-def _with_sleeper(prospect: dict[str, Any]) -> dict[str, Any]:
-    """Attach the Sleeper player id so the prospect lines up with /snapshot."""
-    gsis = prospect.get("gsis_id")
-    sleeper_id = players.sleeper_id_for_gsis(gsis) if gsis else None
-    return {
-        **prospect,
-        "sleeper_player_id": sleeper_id,
-        "sleeper_player": players.resolve(sleeper_id) if sleeper_id else None,
-    }
+    return await public.get(f"/prospect/{player_id}", params={"season": season})
 
 
 @app.post(
@@ -957,30 +808,12 @@ async def capture(
     Thursday and once shortly before Sunday kickoff. Rows identical to the last
     recorded state are skipped, so calling it more often than the lines move
     costs nothing but still captures every real change.
+
+    Odds and injury reports are not specific to this league, so the archive
+    itself lives in the shared public-data service; this just forwards to it.
     """
-    target_season = season or await current_season()
-    target_week = week or await current_week_number()
-
-    if teams:
-        requested = [normalise_abbr(t) for t in teams.split(",") if t.strip()]
-        unknown = [t for t, raw in zip(requested, teams.split(",")) if t is None]
-        if unknown:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown team abbreviation(s) in '{teams}'.",
-            )
-        team_list = [t for t in requested if t]
-    else:
-        team_list = sorted(STADIUMS)
-
-    return await capture_week(
-        db,
-        odds_provider=odds,
-        espn_provider=espn,
-        season=target_season,
-        week=target_week,
-        teams=team_list,
-        refresh=refresh,
+    return await public.post(
+        "/capture", params={"week": week, "season": season, "teams": teams, "refresh": refresh}
     )
 
 
@@ -991,15 +824,23 @@ async def capture(
     summary="What is in the archive",
 )
 async def history_inventory() -> dict[str, Any]:
-    """Rows, weeks and file sizes per source and season."""
+    """Rows, weeks and file sizes per source and season.
+
+    Merges this league's own archive (transactions, draft picks, roster
+    snapshots, decisions) with the odds/injury archive from the shared
+    public-data service.
+    """
+    league_stats, public_history = await asyncio.gather(
+        store.inventory(db), public.get("/history")
+    )
     return {
         "database": db.stats(),
-        "archived": await store.inventory(db),
+        "archived": {**league_stats, **(public_history.get("archived") or {})},
         "seasons": await store.seasons(db),
         "note": (
             "Transactions, draft picks and roster snapshots come from /backfill. "
-            "Odds and injuries are captured because they cannot be re-fetched. "
-            "nflverse and Open-Meteo keep their own history upstream."
+            "Odds and injuries are archived by the shared public-data service, "
+            "since they are not specific to this league."
         ),
     }
 
@@ -1022,21 +863,22 @@ async def history_rows(
 
     A subject appears more than once when it actually changed - a line that
     moved, or a player who went from limited to full participation - so the
-    sequence is the history, not just the latest value.
+    sequence is the history, not just the latest value. `odds` and `injuries`
+    are proxied to the shared public-data service; `decisions` is this
+    league's own.
     """
     if source not in HISTORY_SOURCES:
         raise HTTPException(
             status_code=404,
             detail=f"Unknown history source '{source}'. Valid: {', '.join(HISTORY_SOURCES)}.",
         )
+    if source in ("odds", "injuries"):
+        return await public.get(
+            f"/history/{source}", params={"season": season, "week": week, "limit": limit}
+        )
     target_season = season or await current_season()
-    if source == "odds":
-        rows = await store.read_odds(db, target_season, week=week, limit=limit)
-    elif source == "injuries":
-        rows = await store.read_injuries(db, target_season, week=week, limit=limit)
-    else:
-        rows = await store.read_decisions(db, target_season, week=week)
-        rows = rows[-limit:] if limit else rows
+    rows = await store.read_decisions(db, target_season, week=week)
+    rows = rows[-limit:] if limit else rows
     return {
         "source": source,
         "season": target_season,
@@ -1044,41 +886,6 @@ async def history_rows(
         "count": len(rows),
         "rows": rows,
     }
-
-
-async def _archive_injuries(report: dict[str, Any]) -> None:
-    """Archive a team injury report that was just refreshed from ESPN."""
-    if not settings.history_auto_capture:
-        return
-    if not (report.get("cache") or {}).get("refreshed"):
-        return
-    team = report.get("team")
-    injuries = report.get("injuries") or []
-    if not team or not injuries:
-        return
-    season, week = await _current_season_week()
-    await auto_capture(db, "injuries", season, week, injury_rows(team, injuries))
-
-
-# The season and week only change once a week, so one Sleeper call an hour is
-# plenty - and it keeps auto-capture from adding a round trip per request.
-_SEASON_WEEK_MEMO: dict[str, Any] = {"value": None, "at": 0.0}
-_SEASON_WEEK_TTL = 3600.0
-
-
-async def _current_season_week() -> tuple[int | None, int | None]:
-    import time as _time
-
-    if _SEASON_WEEK_MEMO["value"] and (_time.time() - _SEASON_WEEK_MEMO["at"]) < _SEASON_WEEK_TTL:
-        return _SEASON_WEEK_MEMO["value"]
-    try:
-        state = await client.nfl_state()
-        value = (int(state.get("season")), services.current_week(state))
-    except (HTTPException, TypeError, ValueError) as exc:
-        log.warning("Could not resolve the current season/week for auto-capture: %s", exc)
-        return (None, None)
-    _SEASON_WEEK_MEMO.update(value=value, at=_time.time())
-    return value
 
 
 async def current_week_number() -> int:

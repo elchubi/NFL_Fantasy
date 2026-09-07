@@ -1,41 +1,31 @@
+# Brings up all three services together for local development: the shared
+# public-data service, this league's backend, and its MCP connector. Railway
+# does not use this file - each service deploys independently there (see
+# README's "Deploying on Railway"). Running a second league locally means
+# adding another sleeper-api/sleeper-mcp pair pointed at the same public-data
+# service; see the README for the equivalent on Railway.
 services:
-  sleeper-api:
-    build: .
-    # Local development only - Railway ignores this file and builds the Dockerfile.
-    # A prebuilt image can be used instead of building:
-    # image: ghcr.io/<your-user>/sleeper-fantasy-api:latest
-    container_name: sleeper-fantasy-api
+  public-data:
+    build: ./public_data
+    container_name: sleeper-fantasy-public-data
     restart: unless-stopped
     environment:
-      # Required
-      LEAGUE_ID: ${LEAGUE_ID:?set LEAGUE_ID in your .env}
-      API_KEY: ${API_KEY:?set API_KEY in your .env}
-      # Optional (defaults shown)
-      PLAYERS_CACHE_PATH: /data/players_cache.json
+      API_KEY: ${PUBLIC_DATA_API_KEY:?set PUBLIC_DATA_API_KEY in your .env}
       CACHE_DIR: /data
-      PLAYERS_CACHE_TTL_HOURS: ${PLAYERS_CACHE_TTL_HOURS:-20}
-      # External sources. Only The Odds API needs a key; without it /odds
-      # returns 503 and everything else keeps working.
+      DATABASE_PATH: /data/public.db
+      PLAYERS_CACHE_PATH: /data/players_cache.json
       ODDS_API_KEY: ${ODDS_API_KEY:-}
       ODDS_CACHE_TTL_HOURS: ${ODDS_CACHE_TTL_HOURS:-24}
       NFLVERSE_CACHE_TTL_HOURS: ${NFLVERSE_CACHE_TTL_HOURS:-24}
       NFLVERSE_INCLUDE_RED_ZONE: ${NFLVERSE_INCLUDE_RED_ZONE:-true}
       ESPN_CACHE_TTL_HOURS: ${ESPN_CACHE_TTL_HOURS:-3}
       WEATHER_CACHE_TTL_HOURS: ${WEATHER_CACHE_TTL_HOURS:-12}
-      # SQLite database with the league history (see /backfill and /capture).
-      DATABASE_PATH: /data/league.db
-      HISTORY_AUTO_CAPTURE: ${HISTORY_AUTO_CAPTURE:-true}
-      HTTP_TIMEOUT: ${HTTP_TIMEOUT:-20}
-      PLAYERS_HTTP_TIMEOUT: ${PLAYERS_HTTP_TIMEOUT:-120}
-      PORT: ${PORT:-8000}
-      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      PORT: 8000
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     ports:
-      - "${PORT:-8000}:8000"
+      - "${PUBLIC_DATA_PORT:-8100}:8000"
     volumes:
-      # Keeps every source cache across restarts: the ~5MB Sleeper player file
-      # and the ~5MB nflverse aggregate, so neither is re-downloaded on deploy.
-      - players-cache:/data
+      - public-data-cache:/data
     healthcheck:
       test:
         - CMD
@@ -47,5 +37,60 @@ services:
       retries: 3
       start_period: 10s
 
+  sleeper-api:
+    build: .
+    container_name: sleeper-fantasy-api
+    restart: unless-stopped
+    depends_on:
+      public-data:
+        condition: service_healthy
+    environment:
+      LEAGUE_ID: ${LEAGUE_ID:?set LEAGUE_ID in your .env}
+      API_KEY: ${API_KEY:?set API_KEY in your .env}
+      PLAYERS_CACHE_PATH: /data/players_cache.json
+      CACHE_DIR: /data
+      PLAYERS_CACHE_TTL_HOURS: ${PLAYERS_CACHE_TTL_HOURS:-20}
+      DATABASE_PATH: /data/league.db
+      HISTORY_AUTO_CAPTURE: ${HISTORY_AUTO_CAPTURE:-true}
+      # Reached over the compose network, by service name - not the internet.
+      PUBLIC_DATA_URL: http://public-data:8000
+      PUBLIC_DATA_API_KEY: ${PUBLIC_DATA_API_KEY:?set PUBLIC_DATA_API_KEY in your .env}
+      HTTP_TIMEOUT: ${HTTP_TIMEOUT:-20}
+      PORT: 8000
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "${PORT:-8000}:8000"
+    volumes:
+      - league-cache:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  sleeper-mcp:
+    build: ./mcp_server
+    container_name: sleeper-fantasy-mcp
+    restart: unless-stopped
+    depends_on:
+      sleeper-api:
+        condition: service_healthy
+    environment:
+      BACKEND_URL: http://sleeper-api:8000
+      BACKEND_API_KEY: ${API_KEY:?set API_KEY in your .env}
+      MCP_URL_TOKEN: ${MCP_URL_TOKEN:?set MCP_URL_TOKEN in your .env}
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-}
+      PORT: 8080
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "${MCP_PORT:-8080}:8080"
+
 volumes:
-  players-cache:
+  public-data-cache:
+  league-cache:

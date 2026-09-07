@@ -1,0 +1,35 @@
+services:
+  public-data:
+    build: .
+    container_name: sleeper-fantasy-public-data
+    restart: unless-stopped
+    environment:
+      API_KEY: ${API_KEY:?set API_KEY in your .env}
+      CACHE_DIR: /data
+      DATABASE_PATH: /data/public.db
+      PLAYERS_CACHE_PATH: /data/players_cache.json
+      ODDS_API_KEY: ${ODDS_API_KEY:-}
+      NFLVERSE_CACHE_TTL_HOURS: ${NFLVERSE_CACHE_TTL_HOURS:-24}
+      NFLVERSE_INCLUDE_RED_ZONE: ${NFLVERSE_INCLUDE_RED_ZONE:-true}
+      ODDS_CACHE_TTL_HOURS: ${ODDS_CACHE_TTL_HOURS:-24}
+      ESPN_CACHE_TTL_HOURS: ${ESPN_CACHE_TTL_HOURS:-3}
+      WEATHER_CACHE_TTL_HOURS: ${WEATHER_CACHE_TTL_HOURS:-12}
+      PORT: ${PORT:-8000}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "${PORT:-8000}:8000"
+    volumes:
+      - public-data-cache:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,urllib.request,sys; p=os.getenv('PORT','8000'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}/health', timeout=4).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  public-data-cache:

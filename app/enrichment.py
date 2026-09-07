@@ -4,6 +4,13 @@ Each block is opt-in through `?include=` so the default snapshot stays the
 cheap Sleeper-only payload. A source that fails is reported inline as an
 `error` on its own block rather than failing the whole snapshot — a missing
 odds key should never cost you the roster.
+
+Every source here now lives in the shared public-data service (see
+app/public_client.py) rather than being computed locally, since none of it is
+specific to this league. That service does its own upstream fetching, caching
+and archiving; this module's job is orchestration — which players and NFL
+teams matter for *this* league's roster — plus turning a proxy failure into
+the same inline error shape the rest of /snapshot already expects.
 """
 
 from __future__ import annotations
@@ -15,8 +22,8 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from app.history import auto_capture, injury_rows, odds_rows  # noqa: F401
 from app.players import PlayerStore
+from app.public_client import PublicDataClient
 from app.teams import normalise_abbr
 
 log = logging.getLogger(__name__)
@@ -76,7 +83,7 @@ async def _guarded(name: str, coro: Any) -> dict[str, Any]:
 async def build_blocks(
     includes: list[str],
     *,
-    providers: dict[str, Any],
+    public: PublicDataClient,
     players: PlayerStore,
     snapshot_teams: list[dict[str, Any]],
     week: int,
@@ -92,30 +99,16 @@ async def build_blocks(
     tasks: dict[str, Any] = {}
     if "advanced_stats" in includes:
         tasks["advanced_stats"] = _guarded(
-            "advanced_stats",
-            advanced_stats_block(providers["nflverse"], players, roster_players, season),
+            "advanced_stats", advanced_stats_block(public, roster_players, season)
         )
     if "odds" in includes:
-        tasks["odds"] = _guarded(
-            "odds", odds_block(providers["odds"], week, season, providers.get("history"))
-        )
+        tasks["odds"] = _guarded("odds", odds_block(public, week, season))
     if "injury_report" in includes:
         tasks["injury_report"] = _guarded(
-            "injury_report",
-            injury_block(
-                providers["espn"],
-                players,
-                roster_players,
-                nfl_teams,
-                season,
-                week,
-                providers.get("history"),
-            ),
+            "injury_report", injury_block(public, players, roster_players, nfl_teams)
         )
     if "weather" in includes:
-        tasks["weather"] = _guarded(
-            "weather", weather_block(providers["espn"], providers["weather"], week, season)
-        )
+        tasks["weather"] = _guarded("weather", weather_block(public, week, season))
 
     results = await asyncio.gather(*tasks.values())
     return dict(zip(tasks.keys(), results))
@@ -125,32 +118,49 @@ async def build_blocks(
 
 
 async def advanced_stats_block(
-    nflverse: Any,
-    players: PlayerStore,
+    public: PublicDataClient,
     roster_players: list[dict[str, Any]],
     season: int | None,
 ) -> dict[str, Any]:
-    """nflverse usage for every rostered player, keyed by Sleeper player id."""
-    data, meta = await nflverse.season_data(season or datetime.now(timezone.utc).year)
-    by_gsis = data.get("players") or {}
+    """nflverse usage for every rostered player, keyed by Sleeper player id.
+
+    One call per player to the public-data service, in parallel - a team
+    defense (no gsis_id) or a player nflverse has no data for both come back
+    as a 404, which is expected and sorted into `unmatched_players` rather
+    than treated as a failure.
+    """
+    skill_players = [p for p in roster_players if p.get("position") != "DEF"]
+
+    async def one(player: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        try:
+            result = await public.get(
+                f"/advanced-stats/{player['player_id']}", params={"season": season}
+            )
+        except HTTPException:
+            return player, None
+        return player, result
+
+    results = await asyncio.gather(*[one(p) for p in skill_players])
 
     stats: dict[str, Any] = {}
     unmatched: list[str] = []
-    for player in roster_players:
-        gsis = players.gsis_id(player["player_id"])
-        entry = by_gsis.get(gsis) if gsis else None
-        if entry is None:
-            # Team defenses have no gsis_id at all; that is expected.
-            if player.get("position") != "DEF":
-                unmatched.append(player["name"])
+    season_out: int | None = season
+    sources: list[str] | None = None
+    for player, result in results:
+        stats_block = (result or {}).get("stats") if result and result.get("found") else None
+        if stats_block is None:
+            unmatched.append(player["name"])
             continue
+        if result.get("season") is not None:
+            season_out = result["season"]
+        sources = sources or result.get("sources")
         stats[player["player_id"]] = {
             "name": player["name"],
             "position": player.get("position"),
-            "season_averages": entry.get("season_averages"),
-            "recent_averages": entry.get("recent_averages"),
-            "trend_vs_season": entry.get("trend"),
-            "role_note": entry.get("role_note"),
+            "season_averages": stats_block.get("season_averages"),
+            "recent_averages": stats_block.get("recent_averages"),
+            "trend_vs_season": stats_block.get("trend_vs_season"),
+            "role_note": stats_block.get("role_note"),
         }
 
     movers = sorted(
@@ -161,55 +171,40 @@ async def advanced_stats_block(
 
     return {
         "available": True,
-        "season": data.get("season"),
-        "sources": data.get("sources"),
+        "season": season_out or (season or datetime.now(timezone.utc).year),
+        "sources": sources,
         "players": stats,
         "biggest_role_changes": movers,
         "unmatched_players": unmatched,
-        "cache": meta,
     }
 
 
-async def odds_block(
-    odds: Any, week: int, season: int | None, history: Any = None
-) -> dict[str, Any]:
-    if not odds.configured:
-        return {
-            "available": False,
-            "error": "ODDS_API_KEY is not configured; set it to enable betting lines.",
-        }
-    payload = await odds.for_week(week, season)
-    if history is not None and (payload.get("cache") or {}).get("refreshed"):
-        await auto_capture(history, "odds", season, week, odds_rows(payload["games"]))
+async def odds_block(public: PublicDataClient, week: int, season: int | None) -> dict[str, Any]:
+    payload = await public.get(f"/odds/{week}", params={"season": season})
     return {"available": True, **payload}
 
 
 async def injury_block(
-    espn: Any,
+    public: PublicDataClient,
     players: PlayerStore,
     roster_players: list[dict[str, Any]],
     nfl_teams: list[str],
-    season: int | None = None,
-    week: int | None = None,
-    history: Any = None,
 ) -> dict[str, Any]:
     """ESPN injury reports for the teams that rostered players play for."""
-    reports = await asyncio.gather(
-        *[espn.team_report(team) for team in nfl_teams], return_exceptions=True
+    results = await asyncio.gather(
+        *[public.get("/injury-report", params={"team": team}) for team in nfl_teams],
+        return_exceptions=True,
     )
 
     by_espn_id: dict[str, dict[str, Any]] = {}
     by_name: dict[str, dict[str, Any]] = {}
     failures: list[str] = []
-    fresh: list[dict[str, Any]] = []
     succeeded = 0
-    for team, report in zip(nfl_teams, reports):
+    for team, report in zip(nfl_teams, results):
         if isinstance(report, BaseException):
             failures.append(f"{team}: {getattr(report, 'detail', report)}")
             continue
         succeeded += 1
-        if history is not None and (report.get("cache") or {}).get("refreshed"):
-            fresh.extend(injury_rows(team, report.get("injuries") or []))
         for item in report.get("injuries", []):
             if item.get("espn_id"):
                 by_espn_id[str(item["espn_id"])] = {**item, "nfl_team": team}
@@ -236,14 +231,11 @@ async def injury_block(
             "comment": item.get("comment"),
         }
 
-    if fresh:
-        await auto_capture(history, "injuries", season, week, fresh)
-
     if nfl_teams and not succeeded:
         # Every team failed; saying "available" here would hide the outage.
         return {
             "available": False,
-            "error": f"ESPN was unreachable for all {len(nfl_teams)} teams.",
+            "error": f"The public-data service was unreachable for all {len(nfl_teams)} teams.",
             "teams_unavailable": failures,
         }
 
@@ -256,61 +248,12 @@ async def injury_block(
     }
 
 
-async def weather_block(
-    espn: Any, weather: Any, week: int, season: int | None
-) -> dict[str, Any]:
-    """Forecasts for the week's open-air venues; domes short-circuit."""
-    schedule = await espn.schedule(week, season)
-    games = schedule.get("games") or []
-    if not games:
-        return {
-            "available": False,
-            "error": (
-                "No schedule available from ESPN for this week, so there are no "
-                "venues to fetch weather for."
-            ),
-        }
+async def weather_block(public: PublicDataClient, week: int, season: int | None) -> dict[str, Any]:
+    """Forecasts for the week's open-air venues; domes short-circuit.
 
-    forecasts = await asyncio.gather(
-        *[
-            weather.for_venue(game["home_team"], _kickoff(game.get("kickoff")))
-            for game in games
-            if game.get("home_team")
-        ],
-        return_exceptions=True,
-    )
-
-    results = []
-    for game, forecast in zip([g for g in games if g.get("home_team")], forecasts):
-        if isinstance(forecast, BaseException):
-            results.append(
-                {
-                    "game": game.get("name"),
-                    "home_team": game.get("home_team"),
-                    "error": str(getattr(forecast, "detail", forecast)),
-                }
-            )
-            continue
-        results.append({"game": game.get("name"), "away_team": game.get("away_team"), **forecast})
-
-    return {
-        "available": True,
-        "week": week,
-        "games": results,
-        "outdoor_games_with_concerns": [
-            g
-            for g in results
-            if (g.get("weather") or {}).get("fantasy_impact", {}).get("severity")
-            in ("moderate", "high")
-        ],
-    }
-
-
-def _kickoff(value: Any) -> datetime | None:
-    if not value:
-        return None
-    try:
-        moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+    The public-data service already does this orchestration internally (it
+    owns both the schedule and the weather provider), so this is a direct
+    passthrough.
+    """
+    payload = await public.get(f"/weather/{week}", params={"season": season})
+    return payload if "available" in payload else {"available": True, **payload}

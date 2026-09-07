@@ -6,14 +6,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ.setdefault("LEAGUE_ID", "1390746710426255360")
 os.environ.setdefault("API_KEY", "test-key")
 
 import pytest  # noqa: E402
 
 from app import espn, nflverse, odds, weather  # noqa: E402
 from app.cache import KeyedDiskCache  # noqa: E402
-from app.enrichment import parse_includes, rostered_players, rostered_teams  # noqa: E402
 from app.teams import STADIUMS, nfl_team_abbr, normalise_abbr  # noqa: E402
 from tests import fixtures_external as fx  # noqa: E402
 
@@ -325,41 +323,3 @@ def test_cache_ignores_a_file_written_by_an_older_schema(tmp_path):
     old = KeyedDiskCache(path, name="t", default_ttl_seconds=3600, schema_version=2)
     assert old.load() is False
     assert old.peek("k") is None
-
-
-# --- Snapshot integration -----------------------------------------------------
-
-
-def test_include_parsing_rejects_unknown_sources():
-    from fastapi import HTTPException
-
-    assert parse_includes(None) == []
-    assert parse_includes("odds, weather") == ["odds", "weather"]
-    assert parse_includes("odds,odds") == ["odds"]
-    with pytest.raises(HTTPException) as exc:
-        parse_includes("odds,astrology")
-    assert "astrology" in str(exc.value.detail)
-
-
-def test_rostered_players_are_collected_across_every_slot():
-    teams = [
-        {
-            "starters": [
-                {"player": {"player_id": "1", "name": "A", "nfl_team": "KC"}},
-                {"player": None},
-            ],
-            "bench": [{"player_id": "2", "name": "B", "nfl_team": "SF"}],
-            "injured_reserve": [{"player_id": "3", "name": "C", "nfl_team": "JAC"}],
-            "taxi_squad": [],
-        },
-        {
-            "starters": [{"player": {"player_id": "1", "name": "A", "nfl_team": "KC"}}],
-            "bench": [],
-            "injured_reserve": [],
-            "taxi_squad": [],
-        },
-    ]
-    players = rostered_players(teams)
-    assert sorted(p["player_id"] for p in players) == ["1", "2", "3"]
-    # JAC is normalised to JAX so the ESPN/weather lookups hit the right team.
-    assert rostered_teams(players) == ["JAX", "KC", "SF"]

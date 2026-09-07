@@ -13,6 +13,39 @@ IDs, and the file that maps those IDs to names weighs ~5MB (Sleeper asks that yo
 it at most once a day). This service does that cross-referencing for you and caches the
 player file on disk.
 
+## Architecture: three services, not one
+
+This repo is actually **three independently deployable services**, split along one line:
+is the data specific to *this* fantasy league, or is it the same regardless of who is
+asking?
+
+| Service | Directory | Holds | Deployed |
+| --- | --- | --- | --- |
+| **Public data** | `public_data/` | Player names, advanced stats, betting lines, injury reports, weather, the draft board. Not specific to any league. | **Once** |
+| **League backend** | `/` (this directory) | Rosters, matchups, transactions, standings, manager profiles, decisions, this league's own history. | **Once per league** |
+| **MCP connector** | `mcp_server/` | Nothing - a thin wrapper exposing one league backend's API as tools for Claude.ai. | Once per league |
+
+Player data, snap counts, betting lines and injury reports are the same no matter which
+league is asking about them. Computing and caching them separately per league would mean
+downloading nflverse's ~120MB of source files once per league, burning through The Odds
+API's ~500/month free quota that much faster, and hitting Sleeper's player file more than
+the once-a-day it asks for. The public-data service exists so each of those is paid for
+exactly once, and every league backend - one, two, or a dozen - shares the result.
+
+Concretely: the league backend never talks to nflverse, The Odds API, ESPN or Open-Meteo
+directly any more. Its `/advanced-stats`, `/odds`, `/injury-report*`, `/weather`,
+`/draft-class`, `/prospect` endpoints are still there, at the same paths, with the same
+behavior - they just proxy to the shared service over Railway's private network instead
+of computing it locally. Nothing about calling this API from the outside changes; see
+[public_data/README.md](public_data/README.md) for that service on its own, and
+[Deploying on Railway](#deploying-on-railway) below for how the three fit together and
+how to add a second league.
+
+**Running two leagues means two full `{league backend + MCP}` pairs**, each with its own
+`LEAGUE_ID`, `API_KEY` and database - genuinely separate, no shared state, no risk of one
+league's data leaking into another - pointed at the **same** public-data service. See
+[Deploying a second league](#deploying-a-second-league) below.
+
 ## Endpoints
 
 Base URL is wherever you deployed it. Every endpoint except `/health` requires
@@ -37,6 +70,10 @@ Base URL is wherever you deployed it. Every endpoint except `/health` requires
 | `GET` | `/injury-report/{player_id}` | `player_id` | ESPN for one player, next to what Sleeper has cached, so you can see when they disagree. |
 | `GET` | `/weather/{week}` | `week`, `season` | Open-Meteo: forecast at the kickoff hour per stadium. Domes return `indoor: true` without any API call. |
 | `GET` | `/stadiums` | — | The static reference: coordinates and roof type for all 32 stadiums. |
+
+Every endpoint in this table is a thin proxy to the shared `public_data/` service (see
+[Architecture](#architecture-three-services-not-one)) - same path, same params, same
+response, computed once there and reused by every league.
 
 ### League-specific edge
 
@@ -147,6 +184,12 @@ co-owners. Exact match wins, then prefix, then substring — so `/roster/tacos` 
 Four free sources sit behind the endpoints above. Only one of them needs an API key;
 the rest work out of the box. Each has its own disk cache and refresh cadence, chosen
 around how fast the underlying data actually moves.
+
+**All four now live in `public_data/`, not in this codebase** - see
+[Architecture](#architecture-three-services-not-one). This section documents the
+behavior, which is unchanged from the outside; `ODDS_API_KEY` and the cache-TTL
+variables mentioned below belong to that service's environment now (see
+`public_data/.env.example`), not this one's.
 
 | Source | Key needed | Cache TTL | What it adds |
 | --- | --- | --- | --- |
@@ -324,6 +367,9 @@ An unknown `include` value is rejected with `400` and the list of valid ones rat
 being silently ignored.
 
 ## Rookie draft board
+
+**Also served by `public_data/`** - the draft board is the same for every league, so it
+lives with the other shared sources.
 
 In a keeper league with one keeper you never stash prospects, so a rookie only matters
 if he produces **in his rookie season**. That narrows what is worth tracking a great
@@ -521,10 +567,10 @@ id: in Sleeper **every season is a separate league**, chained backwards by
 `previous_league_id`. A single `LEAGUE_ID` only ever reaches the current season, which is
 why manager profiling was one season deep until `/backfill` existed.
 
-### The database
+### Two databases, split the same way as everything else
 
-Everything the league needs remembered lives in one SQLite file (`DATABASE_PATH`,
-`/data/league.db` by default):
+This league's own SQLite file (`DATABASE_PATH`, `/data/league.db` by default) holds only
+what is specific to it:
 
 | Table | Holds | Written by |
 | --- | --- | --- |
@@ -532,21 +578,25 @@ Everything the league needs remembered lives in one SQLite file (`DATABASE_PATH`
 | `transactions` | Every transaction, every season | `/backfill` |
 | `draft_picks` | Every draft, every season | `/backfill` |
 | `roster_snapshots` | Rosters and standings per week | `/backfill` |
-| `odds_history` | Betting lines as they moved | `/capture`, and reads |
-| `injury_history` | Injury reports as they changed | `/capture`, and reads |
 | `decisions` | Your decision log | `/decision` |
 
-Standard-library `sqlite3`, no ORM. WAL mode, so a read never waits behind a write.
-Schema changes are versioned migrations applied at startup (`PRAGMA user_version`), and a
-database written by a newer build is refused rather than downgraded.
+Betting lines and injury reports are **not** in this file - they are not specific to this
+league, so they live in `public_data/public.db` instead, shared by every league that
+points at the same public-data service (see
+[Architecture](#architecture-three-services-not-one)). `/history` and `/history/{source}`
+below transparently merge the two: `odds` and `injuries` are proxied from the shared
+service, `decisions` is read from this league's own file.
 
+Both databases use the same design: standard-library `sqlite3`, no ORM, WAL mode so a
+read never waits behind a write, versioned migrations applied at startup (`PRAGMA
+user_version`), and a database written by a newer build refused rather than downgraded.
 Every table also keeps the upstream row verbatim in a `payload` column beside the
-extracted ones. Wanting a field later is then a query change rather than a migration
-*plus* a re-fetch of data that may no longer exist.
+extracted ones, so wanting a field later is a query change rather than a migration *plus*
+a re-fetch of data that may no longer exist.
 
 Sizing, measured rather than guessed: a 12-team league produces around 360 transactions a
-season, so **a decade of complete league history is under 1MB**. Reading all of it and
-computing every manager profile takes about 60ms. Nothing here is close to needing an
+season, so **a decade of one league's complete history is under 1MB**. Reading all of it
+and computing every manager profile takes about 60ms. Nothing here is close to needing an
 index to be fast; the schema is for structure, not for scale.
 
 ### `POST /backfill`
@@ -594,7 +644,10 @@ The gap it leaves is coverage: a week nobody asks about is a week nobody records
 not anyone asked, which is what makes the archive complete rather than a record of your
 browsing. Query params: `week`, `season` (both default to current), `teams` (all 32) and
 `refresh` (default `true`, which bypasses the read caches so the archived line is the one
-live at capture time).
+live at capture time). This endpoint is a proxy to the shared public-data service, which
+owns the archive - if you run more than one league, calling `/capture` on **any** of them
+captures for all of them, since there is only one archive. Calling it from every league's
+cron is harmless (the dedupe below makes the extra calls free) but only one needs to.
 
 **A row identical to the last recorded state is skipped**, whichever path it came from.
 If browsing already recorded Thursday's line, the Thursday cron writes nothing; if nobody
@@ -614,11 +667,13 @@ SF  Christian McCaffrey  practice=limited            <- Friday
 curl -fsS -X POST -H "X-API-Key: $API_KEY" https://your-domain.example/capture
 ```
 
-On Railway, add a service in the same project with **Settings → Cron Schedule** (e.g.
-`0 23 * * 4` and another for Sunday) running that against the backend's private domain.
-Twice a week for 18 weeks is ~36 Odds API calls a season against a ~500/month allowance.
-The automatic path adds no calls of its own — it only archives fetches that were going to
-happen anyway.
+On Railway, add a service in the project running the public-data service, with
+**Settings → Cron Schedule** (e.g. `0 23 * * 4` and another for Sunday) hitting that
+service's own `/capture` over its private domain directly - it needs no league context,
+so there is no reason to route it through a league backend. Twice a week for 18 weeks is
+~36 Odds API calls a season against a ~500/month allowance, shared across every league
+using that key. The automatic path adds no calls of its own — it only archives fetches
+that were going to happen anyway.
 
 ### Reading it back
 
@@ -649,29 +704,25 @@ required).
 
 ## Environment variables
 
+These are for **this league's backend**. The public-data service has its own set (see
+`public_data/.env.example`) - `ODDS_API_KEY` and every provider/cache-TTL variable now
+lives there, not here.
+
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `LEAGUE_ID` | **yes** | — | Sleeper league id, from `sleeper.com/leagues/<LEAGUE_ID>` |
 | `API_KEY` | **yes** | — | Shared secret expected in the `X-API-Key` header |
-| `ODDS_API_KEY` | no | — | Free key from [the-odds-api.com](https://the-odds-api.com). Without it `/odds` returns `503`; everything else works |
-| `PLAYERS_CACHE_PATH` | no | `data/players_cache.json` (`/data/players_cache.json` in Docker) | Where the player file is cached |
-| `PLAYERS_CACHE_TTL_HOURS` | no | `20` | Refresh the player file only after this many hours |
-| `CACHE_DIR` | no | the player cache's directory | Where the other sources' cache files live |
-| `NFLVERSE_CACHE_TTL_HOURS` | no | `24` | How often the nflverse releases are re-pulled |
-| `NFLVERSE_INCLUDE_RED_ZONE` | no | `true` | Set `false` to skip the ~98MB play-by-play download (loses only red zone usage) |
-| `NFLVERSE_DOWNLOAD_TIMEOUT` | no | `300` | Timeout for the large nflverse downloads |
-| `ODDS_CACHE_TTL_HOURS` | no | `24` | How long betting lines are cached (protects the free quota) |
-| `ODDS_REGIONS` | no | `us` | The Odds API regions |
-| `ODDS_BOOKMAKERS` | no | all in region | Restrict to specific books, e.g. `draftkings,fanduel` |
-| `ESPN_CACHE_TTL_HOURS` | no | `3` | How long injury reports are cached |
-| `WEATHER_CACHE_TTL_HOURS` | no | `12` | Forecast cache during the week |
-| `WEATHER_GAMEDAY_CACHE_TTL_HOURS` | no | `1` | Forecast cache once kickoff is within a day |
-| `DATABASE_PATH` | no | `<CACHE_DIR>/league.db` | SQLite file holding the league history |
+| `PUBLIC_DATA_URL` | **yes** | `http://localhost:8100` | Where the shared public-data service lives - its Railway private domain in production |
+| `PUBLIC_DATA_API_KEY` | **yes** | — | That service's own `API_KEY` |
+| `PLAYERS_CACHE_PATH` | no | `data/players_cache.json` (`/data/players_cache.json` in Docker) | Where this backend's local player cache lives, hydrated from the public-data service |
+| `PLAYERS_CACHE_TTL_HOURS` | no | `20` | Refresh the local player cache only after this many hours |
+| `CACHE_DIR` | no | the player cache's directory | Where this backend's other files live |
+| `DATABASE_PATH` | no | `<CACHE_DIR>/league.db` | SQLite file holding this league's own history |
 | `HISTORY_AUTO_CAPTURE` | no | `true` | Also archive what read endpoints pull fresh, not just `/capture` |
 | `SLEEPER_BASE_URL` | no | `https://api.sleeper.app/v1` | Sleeper API base URL |
 | `HTTP_TIMEOUT` | no | `20` | Per-request timeout (seconds) for Sleeper calls |
-| `PLAYERS_HTTP_TIMEOUT` | no | `120` | Timeout for the ~5MB player file download |
 | `HTTP_MAX_RETRIES` | no | `3` | Attempts per Sleeper call (exponential backoff on 429/5xx/timeouts) |
+| `PUBLIC_DATA_TIMEOUT` | no | `60` | Timeout for calls to the public-data service |
 | `CORS_ORIGINS` | no | `*` | Comma-separated allowed origins |
 | `LOG_LEVEL` | no | `INFO` | Python log level |
 
@@ -681,23 +732,37 @@ Copy `.env.example` to `.env` and fill it in.
 
 ### Docker Compose (the quick way)
 
+The repo root's `docker-compose.yml` brings up all three services together - the shared
+public-data service, this league's backend, and its MCP connector:
+
 ```bash
 cp .env.example .env
-# edit .env: set LEAGUE_ID and a long random API_KEY
+# edit .env: set LEAGUE_ID, API_KEY and PUBLIC_DATA_API_KEY (same value in both places),
+# plus MCP_URL_TOKEN. ODDS_API_KEY is optional.
 docker compose up --build
 ```
 
 ```bash
-curl localhost:8000/health
-curl -H "X-API-Key: <your key>" localhost:8000/snapshot | jq
+curl localhost:8100/health                                     # public-data
+curl localhost:8000/health                                     # this league's backend
+curl -H "X-API-Key: <API_KEY>" localhost:8000/snapshot | jq
+curl localhost:8080/healthz                                    # its MCP connector
 ```
 
+A second league locally means running this same compose file again with a different
+`LEAGUE_ID`/`API_KEY`/ports and `PUBLIC_DATA_URL` pointed at the **same** already-running
+public-data container - or just run `public_data/docker-compose.yml` once, standalone,
+and point as many league stacks at it as you want.
+
 ### Locally, without Docker
+
+Start the public-data service first (see `public_data/README.md`), then:
 
 ```bash
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 export LEAGUE_ID=1390746710426255360 API_KEY=dev-key
+export PUBLIC_DATA_URL=http://localhost:8100 PUBLIC_DATA_API_KEY=<public-data's API_KEY>
 uvicorn main:app --reload
 ```
 
@@ -710,83 +775,120 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
+Each service has its own test suite (`tests/` here, `public_data/tests/`,
+`mcp_server/tests/`) and they are independent - none of them import across service
+boundaries, matching how the services are actually deployed.
+
 ## Deploying on Railway
 
-**The two services do not deploy as one unit.** Railway builds one service per
-deployment, so this repo backs **two services in a single project**, each pointed at a
-different root directory:
+**Three services, not one, and they do not deploy as a unit.** Railway builds one service
+per deployment. The public-data service deploys **once**; each league is its own backend
++ MCP pair pointed at it:
 
-| Service | Root Directory | Domain | Healthcheck |
-| --- | --- | --- | --- |
-| the REST backend | `/` | **none** — private only | `/health` |
-| the MCP server | `/mcp_server` | `mcp.tudominio.com` | `/healthz` |
+| Service | Root Directory | Domain | Healthcheck | How many |
+| --- | --- | --- | --- | --- |
+| Public data | `/public_data` | **none** — private only | `/health` | **1**, ever |
+| League backend | `/` | **none** — private only | `/health` | 1 per league |
+| MCP connector | `/mcp_server` | public | `/healthz` | 1 per league |
 
-**The backend does not need a public domain.** Only the MCP server has to be reachable
-from the internet, since that is the one Claude.ai connects to. The backend is reached
-exclusively over Railway's private network, from the MCP service and nowhere else. This
-is the recommended setup, not just an option — it means the league data and the backend's
-`API_KEY` are never exposed to the public internet at all.
+**Only the MCP connector needs a public domain.** It is the one thing Claude.ai connects
+to. Both backends are reached exclusively over Railway's private network - the
+public-data service by every league backend, each league backend by its own MCP service
+and nothing else. This is the recommended setup, not just an option: it means league data
+and every service's `API_KEY` never touch the public internet.
 
-They build and redeploy independently. `docker-compose.yml` is **ignored by Railway** —
-it stays for local development. Each root has a `railway.json` that pins the Dockerfile
-builder and the healthcheck path.
+They build and redeploy independently. `docker-compose.yml` at the repo root brings up
+all three together for local development, but Railway **ignores that file** and builds
+from each directory's own `Dockerfile` and `railway.json` instead.
 
-### 1. The backend service
+### 1. The public-data service (deploy this first, once)
 
 1. **New Project → Deploy from GitHub repo**, pick this repo.
-2. **Settings → Source → Root Directory**: `/`
-3. **Settings → Source → Watch Paths**: `/app/**`, `/main.py`, `/Dockerfile`,
-   `/requirements.txt` — otherwise every commit to `mcp_server/` rebuilds this too.
+2. **Settings → Source → Root Directory**: `/public_data`
+3. **Settings → Source → Watch Paths**: `/public_data/**` — a commit to a league
+   backend or the MCP service should not rebuild this.
 4. **Variables**:
-   - `LEAGUE_ID` — your Sleeper league id
-   - `API_KEY` — `openssl rand -hex 32`
-   - `PLAYERS_CACHE_PATH` = `/data/players_cache.json`
-   - `CACHE_DIR` = `/data`
-   - `DATABASE_PATH` = `/data/league.db`
-   - `ODDS_API_KEY` — optional
-5. **Volume**: attach one mounted at `/data`. This is not optional. Without it the ~5MB
-   player file and the ~5MB nflverse aggregate are rebuilt on every deploy — annoying but
-   recoverable — and `league.db` is **destroyed on every deploy**. The transactions and
-   draft picks in it can be re-fetched with `/backfill`, but the archived betting lines
-   and injury reports cannot be re-fetched from anywhere.
-6. **Networking**: do **not** generate a domain. Leave it private. Railway's healthcheck
-   (`railway.json`'s `healthcheckPath`) runs against the container directly and does not
-   need one; the MCP service reaches it over `RAILWAY_PRIVATE_DOMAIN` (below).
+   - `API_KEY` — `openssl rand -hex 32`. Every league backend will hold this same value
+     as its own `PUBLIC_DATA_API_KEY`.
+   - `ODDS_API_KEY` — optional, free key from the-odds-api.com. Shared by every league.
+   - `CACHE_DIR` = `/data`, `DATABASE_PATH` = `/data/public.db`,
+     `PLAYERS_CACHE_PATH` = `/data/players_cache.json`
+5. **Volume**: attach one mounted at `/data`. Not optional - without it the ~120MB of
+   nflverse source downloads happen on every deploy, and the archived betting lines and
+   injury reports (which cannot be re-fetched from anywhere) are destroyed.
+6. **Networking**: do **not** generate a domain. Every league backend reaches this over
+   `RAILWAY_PRIVATE_DOMAIN` (below).
+
+### 2. A league's backend (repeat per league)
+
+1. In the **same project** (or a new one, either works - only the private-network
+   reachability to the public-data service matters), **New → GitHub Repo**, pick this
+   repo again.
+2. **Settings → Source → Root Directory**: `/`
+3. **Watch Paths**: `/app/**`, `/main.py`, `/Dockerfile`, `/requirements.txt`.
+4. **Variables**:
+   - `LEAGUE_ID` — this league's Sleeper league id
+   - `API_KEY` — a **separate** `openssl rand -hex 32`, distinct per league
+   - `PLAYERS_CACHE_PATH` = `/data/players_cache.json`, `CACHE_DIR` = `/data`,
+     `DATABASE_PATH` = `/data/league.db`
+   - `PUBLIC_DATA_URL` = `http://${{public-data.RAILWAY_PRIVATE_DOMAIN}}:${{public-data.PORT}}`
+     — substitute the public-data service's actual name for `public-data`
+   - `PUBLIC_DATA_API_KEY` = the same value as that service's own `API_KEY` (a reference
+     variable if they are in the same project, e.g. `${{public-data.API_KEY}}`; otherwise
+     paste it)
+5. **Volume**: attach one mounted at `/data`, separate from every other league's. Not
+   optional - without it, this league's transactions, draft picks and decision log are
+   lost on every deploy. (Transactions/picks can be rebuilt with `/backfill`; the decision
+   log cannot.)
+6. **Networking**: do **not** generate a domain.
 7. **After the first deploy**, run the backfill once so manager profiling can see past
    seasons. With no public domain there is nothing to `curl` from your machine, so do it
-   through the MCP connector instead, once it is deployed and added to Claude.ai — ask
-   Claude to call the `history_backfill` tool. (If you want to test the backend on its
-   own before wiring up the MCP service, generate a domain temporarily, run the curl, then
-   remove the domain again.)
+   through this league's MCP connector instead, once deployed and added to Claude.ai — ask
+   Claude to call the `history_backfill` tool. (To test the backend on its own first,
+   generate a domain temporarily, run the curl, then remove the domain again.)
 
-### 2. The MCP service
+### 3. That league's MCP connector (repeat per league)
 
-1. In the **same project**, **New → GitHub Repo**, pick the same repo again.
+1. **New → GitHub Repo**, same repo again.
 2. **Settings → Source → Root Directory**: `/mcp_server`
 3. **Watch Paths**: `/mcp_server/**`
 4. **Variables**:
-   - `BACKEND_URL` = `http://${{backend.RAILWAY_PRIVATE_DOMAIN}}:${{backend.PORT}}` —
-     substitute your backend service's actual name for `backend`. This is what keeps the
-     backend off the public internet entirely; traffic never leaves Railway's network.
-   - `BACKEND_API_KEY` = `${{backend.API_KEY}}` — a reference variable, so rotating the
-     key on the backend updates both
-   - `MCP_URL_TOKEN` — `python -c "import secrets; print(secrets.token_urlsafe(32))"`
-   - `MCP_ALLOWED_HOSTS` = your MCP domain
-5. **Networking**: generate a public domain **for this service only**. Claude.ai connects
-   from Anthropic's infrastructure, so the MCP server has to be reachable from the
-   internet — that requirement does not extend to the backend.
+   - `BACKEND_URL` = `http://${{this-league-backend.RAILWAY_PRIVATE_DOMAIN}}:${{this-league-backend.PORT}}`
+     — pointed at **this league's own** backend, not the public-data service
+   - `BACKEND_API_KEY` = that backend's `API_KEY` (a reference variable, e.g.
+     `${{this-league-backend.API_KEY}}`)
+   - `MCP_URL_TOKEN` — `python -c "import secrets; print(secrets.token_urlsafe(32))"`,
+     a fresh one per league
+   - `MCP_ALLOWED_HOSTS` = this league's MCP domain
+5. **Networking**: generate a public domain **for this service**. Claude.ai connects from
+   Anthropic's infrastructure, so this is the one thing that must be internet-reachable.
 
-> `${{backend.RAILWAY_PRIVATE_DOMAIN}}` and `${{backend.PORT}}` are Railway reference
-> variables, resolved from the other service's own variables. This is standard Railway
-> behavior but was not verified against a live deployment while writing this, since
-> Railway's own docs were unreachable from the build environment — if either fails to
-> resolve, check the exact variable names in your backend service's **Variables** tab
-> under **Shared Variables** / the service's own reference name.
+Add the resulting URL (`https://<domain>/<MCP_URL_TOKEN>/mcp`) to Claude.ai as its own
+custom connector. Two leagues means two connectors, cleanly separated - Claude only ever
+sees the one league whichever connector you invoke.
+
+> `${{service.RAILWAY_PRIVATE_DOMAIN}}` / `${{service.PORT}}` / `${{service.API_KEY}}`
+> are Railway reference variables, resolved from another service's own variables. This is
+> standard Railway behavior but was not verified against a live deployment while writing
+> this, since Railway's own docs were unreachable from the build environment - if one
+> fails to resolve, check the exact variable names in that service's **Variables** tab.
+
+### Deploying a second league
+
+Once the public-data service is running, a second league costs exactly two more
+services: repeat **step 2** and **step 3** above with the new league's own `LEAGUE_ID`,
+`API_KEY`, volume and MCP token, pointed at the **same** `PUBLIC_DATA_URL`. Nothing about
+the public-data service changes - it already serves every league that points at it.
+
+The two leagues share nothing else: separate databases, separate volumes, separate API
+keys, separate MCP connector URLs. A bug or an outage in one league's backend cannot
+touch the other's data. The only thing they share on purpose is the public-data service
+and, if you reuse the same `ODDS_API_KEY`, its monthly quota.
 
 ### Two things Railway does differently
 
 **It assigns the port.** Railway injects `PORT` and expects the process to bind it; a
-hardcoded port builds and starts fine and then fails its healthcheck forever. Both
+hardcoded port builds and starts fine and then fails its healthcheck forever. All three
 services start through `entrypoint.py`, which reads `PORT`.
 
 **Private networking is IPv6-only.** A process bound to `0.0.0.0` is unreachable at
@@ -797,14 +899,14 @@ in both places. `HOST` overrides the detection if you need it to.
 
 ### Verifying
 
-With no public domain on the backend, its own health is checked two ways:
+With no public domain on either backend, each one's own health is checked two ways:
 
-- **Railway's dashboard** — the backend's deployment shows healthy/unhealthy from
+- **Railway's dashboard** — each deployment shows healthy/unhealthy from its own
   `railway.json`'s `healthcheckPath`, checked against the container directly over
   Railway's internal network. No domain involved.
-- **The `health_check` MCP tool** — proves the whole chain: Claude.ai → MCP service →
-  private network → backend. This is the check that actually matters, since it is the
-  same path every other tool call takes.
+- **The `health_check` MCP tool** — proves the whole chain for one league: Claude.ai →
+  MCP service → league backend → public-data service. This is the check that actually
+  matters, since it is the same path every other tool call takes.
 
 ```bash
 curl https://mcp.tudominio.com/healthz
@@ -812,14 +914,16 @@ curl https://mcp.tudominio.com/healthz
 
 `/healthz` is the MCP server's own liveness — it reports the backend URL it is pointed at
 and whether the key is configured, but deliberately does **not** call the backend, so it
-stays green even if the backend is down. That is intentional: Railway's platform-level
-healthcheck should reflect this service's own process, not a dependency it cannot fix by
-restarting. Use `health_check` (the tool, through Claude) for the end-to-end check.
+stays green even if the backend is down. Likewise each backend's own `/health` does not
+call the public-data service. That is intentional: a platform-level healthcheck should
+reflect this process's own state, not a dependency it cannot fix by restarting. Use
+`health_check` (the tool, through Claude) for the end-to-end check.
 
 ### Running it locally
 
-`docker compose up --build` still works for both (see each `docker-compose.yml`); Railway
-just does not use those files.
+`docker compose up --build` from the repo root brings up all three services together
+(see the root `docker-compose.yml`); each service also has its own `docker-compose.yml`
+for running it standalone. Railway does not use any of these files.
 
 ## What was and wasn't verified
 
@@ -830,6 +934,16 @@ machine this was built on:
   multi-season profiling, and that a re-run of `/backfill` skips finished seasons (54
   Sleeper calls on the first run, 18 on the second). Driven against a three-season fake
   league, since Sleeper itself is unreachable from the build environment.
+- **Verified the three-service split, end to end.** All three services (public-data,
+  a league backend, and a fake upstream standing in for Sleeper/The Odds API/ESPN/
+  Open-Meteo) were started as real, independent processes talking over real HTTP - not
+  mocked in-process. Confirmed: player names resolve through `/snapshot` via the
+  public-data service's `/players` endpoint rather than any local Sleeper call;
+  `/snapshot?include=odds,injury_report,weather` assembles correctly through the
+  rewritten `enrichment.py`; `/odds`, `/injury-report*`, `/capture` and `/history` proxy
+  with byte-for-byte identical error messages; a repeated `/capture` correctly skips an
+  unchanged line; and a league backend's own `API_KEY` is rejected by the public-data
+  service (401) - proving the two are genuinely, separately secured.
 - **Verified against the live service.** nflverse: the column names, the `gsis_id` /
   `pfr_id` join, the red zone aggregation, the season fallback, and the draft board
   (2026 class: 80 skill picks, all with `gsis_id`, 70 matched to combine data) were all
@@ -845,7 +959,8 @@ machine this was built on:
 
 The first real call to `/injury-report?team=KC` is the one worth eyeballing: if
 `injuries` comes back empty while ESPN's site shows a report, the envelope shape moved
-and `parse_injuries` in `app/espn.py` needs a new key added to `_candidate_lists`.
+and `parse_injuries` in `public_data/app/espn.py` needs a new key added to
+`_candidate_lists`.
 
 ## How it behaves against Sleeper
 
@@ -866,6 +981,9 @@ and `parse_injuries` in `app/espn.py` needs a new key added to `_candidate_lists
 
 ## How it behaves against the external sources
 
+This describes the public-data service's internals, which every league backend proxies
+to - see [Architecture](#architecture-three-services-not-one).
+
 - **Every source has its own cache file and TTL**, keyed inside the file (by season,
   week or team) so one stale key never forces a full refresh. Concurrent requests for
   the same key share a single refresh.
@@ -885,43 +1003,55 @@ and `parse_injuries` in `app/espn.py` needs a new key added to `_candidate_lists
 
 ## Project layout
 
+This repo holds all three services (see
+[Architecture](#architecture-three-services-not-one)):
+
 ```
+League backend (this directory - one per league)
 main.py                 FastAPI app, routes, CORS, lifespan
 app/config.py           Environment-driven settings
 app/security.py         X-API-Key dependency (fails closed)
-app/http.py             Shared retry/timeout helpers + streaming downloads
-app/cache.py            Keyed disk caches with per-source TTLs
-app/sleeper.py          Async Sleeper client: timeouts, retries, error mapping
-app/players.py          Disk-backed player cache + ID resolution + cross-source ids
+app/sleeper.py          Async Sleeper client for this league's own data
+app/public_client.py    HTTP client for the shared public-data service
+app/players.py          Local player cache, hydrated from public-data
 app/humanize.py         Sleeper setting/scoring keys -> plain language
 app/services.py         Roster, matchup, transaction and snapshot assembly
-app/nflverse.py         nflverse releases: download, join on gsis_id, aggregate
-app/odds.py             The Odds API: consensus lines and game script
-app/espn.py             ESPN injuries and schedule (defensive parsing)
-app/weather.py          Open-Meteo forecasts, domes short-circuited
-app/draft.py            Rookie draft board: draft capital, combine, landing spot
+app/enrichment.py       The optional ?include= blocks on /snapshot (proxies)
 app/managers.py         Opponent profiles from transaction and draft history
 app/pressure.py         Structural gaps: bye collisions, injuries, no cover
-app/schedule.py         Bye weeks derived from the nflverse schedule
 app/teams.py            Static stadium coordinates, roof types, name aliases
-app/enrichment.py       The optional ?include= blocks on /snapshot
 app/db.py               SQLite connection, schema and versioned migrations
-app/store.py            Typed reads and writes over the database
+app/store.py            Typed reads and writes over this league's database
 app/backfill.py         Walks previous_league_id and archives each season
-app/history.py          Capture logic for odds and injury reports
+app/history.py          The decision log
 tests/                  Offline tests against fixture payloads
-mcp_server/             MCP server exposing this API to Claude.ai (own README)
-Dockerfile              Multi-stage build, non-root, healthcheck
-docker-compose.yml      Example deployment with a persistent cache volume
+Dockerfile, docker-compose.yml, railway.json
+
+public_data/            Shared service - deploy once (own README)
+  app/nflverse.py       nflverse releases: download, join on gsis_id, aggregate
+  app/odds.py           The Odds API: consensus lines and game script
+  app/espn.py           ESPN injuries and schedule (defensive parsing)
+  app/weather.py        Open-Meteo forecasts, domes short-circuited
+  app/draft.py          Rookie draft board: draft capital, combine, landing spot
+  app/schedule.py       Bye weeks derived from the nflverse schedule
+  app/players.py        The canonical Sleeper player cache
+  app/db.py, app/store.py, app/history.py   Odds/injury archive
+  main.py, Dockerfile, docker-compose.yml, railway.json
+
+mcp_server/             MCP connector exposing one league to Claude.ai (own README)
+
+docker-compose.yml      Brings up all three together, for local development
 ```
 
 ## MCP connector
 
-`mcp_server/` is a separate service that wraps this API as an
-[MCP](https://modelcontextprotocol.io) server, so the league can be added to Claude.ai as
-a remote custom connector (Customize → Connectors → Add custom connector). It exposes 21
-tools, one per endpoint, over Streamable HTTP, and keeps `API_KEY` on the server side so
-the Claude client never sees it. See [`mcp_server/README.md`](mcp_server/README.md).
+`mcp_server/` is a separate service that wraps one league's backend as an
+[MCP](https://modelcontextprotocol.io) server, so that league can be added to Claude.ai
+as a remote custom connector (Customize → Connectors → Add custom connector). It exposes
+23 tools, one per endpoint, over Streamable HTTP, and keeps `API_KEY` on the server side
+so the Claude client never sees it. A second league gets its own MCP service pointed at
+its own backend - see [Deploying a second league](#deploying-a-second-league). See
+[`mcp_server/README.md`](mcp_server/README.md).
 
 ## Not included (by design)
 

@@ -106,41 +106,10 @@ MIGRATIONS: list[str] = [
         PRIMARY KEY (season, week, roster_id)
     );
     """,
-    # 2 - the sources that evaporate, plus the decision log
+    # 2 - the decision log. Betting lines and injury reports (odds_history /
+    # injury_history) live in the shared public-data service instead, since
+    # they are not specific to any one league.
     """
-    CREATE TABLE odds_history (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        captured_at  TEXT NOT NULL,
-        season       INTEGER NOT NULL,
-        week         INTEGER NOT NULL,
-        game_id      TEXT NOT NULL,
-        home_team    TEXT,
-        away_team    TEXT,
-        home_spread  REAL,
-        away_spread  REAL,
-        total        REAL,
-        favourite    TEXT,
-        payload      TEXT NOT NULL
-    );
-    CREATE INDEX ix_odds_season_week ON odds_history(season, week);
-    CREATE INDEX ix_odds_game ON odds_history(season, week, game_id, id);
-
-    CREATE TABLE injury_history (
-        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-        captured_at             TEXT NOT NULL,
-        season                  INTEGER NOT NULL,
-        week                    INTEGER NOT NULL,
-        team                    TEXT NOT NULL,
-        espn_id                 TEXT,
-        name                    TEXT NOT NULL,
-        status                  TEXT,
-        practice_participation  TEXT,
-        injury_type             TEXT,
-        payload                 TEXT NOT NULL
-    );
-    CREATE INDEX ix_injury_season_week ON injury_history(season, week);
-    CREATE INDEX ix_injury_subject ON injury_history(season, week, team, name, id);
-
     CREATE TABLE decisions (
         id                   INTEGER PRIMARY KEY AUTOINCREMENT,
         decision_id          TEXT NOT NULL,
@@ -280,7 +249,7 @@ class Database:
         connection = self.connect()
         tables = [
             "seasons", "managers", "transactions", "draft_picks",
-            "roster_snapshots", "odds_history", "injury_history", "decisions",
+            "roster_snapshots", "decisions",
         ]
         counts: dict[str, int] = {}
         with self._lock:

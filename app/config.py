@@ -14,52 +14,39 @@ class Settings(BaseSettings):
     league_id: str = ""
     api_key: str = ""
 
-    # Player cache.
+    # Local player cache, hydrated from the public-data service rather than
+    # from Sleeper directly (see app/public_client.py). Still kept on disk
+    # here so roster resolution stays a synchronous, in-memory lookup.
     players_cache_path: str = "data/players_cache.json"
     players_cache_ttl_hours: float = 20.0
 
-    # --- External data sources ------------------------------------------------
     # Where the per-source cache files live (defaults sit next to the player
     # cache so a single mounted volume covers all of them).
     cache_dir: str = ""
 
-    # nflverse (github releases, no key required).
-    nflverse_base_url: str = "https://github.com/nflverse/nflverse-data/releases/download"
-    nflverse_cache_ttl_hours: float = 24.0
-    nflverse_download_timeout: float = 300.0
-    # The play-by-play file is ~98MB; it is the only source of red zone usage.
-    # Set to false to skip it and serve every other advanced stat.
-    nflverse_include_red_zone: bool = True
-
-    # The Odds API (free tier: ~500 requests/month, so cache hard).
-    odds_api_key: str = ""
-    odds_base_url: str = "https://api.the-odds-api.com/v4"
-    odds_cache_ttl_hours: float = 24.0
-    odds_regions: str = "us"
-    odds_bookmakers: str = ""
-
-    # ESPN (unofficial, no key). Injury news moves during the week.
-    espn_base_url: str = "https://site.api.espn.com/apis/site/v2/sports/football/nfl"
-    espn_cache_ttl_hours: float = 3.0
-
     # SQLite database holding the league's own history: transactions, draft
-    # picks, roster snapshots, betting lines, injury reports and decisions.
-    # Empty means "league.db under the cache directory".
+    # picks, roster snapshots and decisions. Empty means "league.db under the
+    # cache directory". Betting lines and injury reports live in the shared
+    # public-data service instead, since they are not league-specific.
     database_path: str = ""
     # Archive whatever a read endpoint pulls fresh from upstream, on top of the
     # scheduled /capture. Set false to archive only on /capture.
     history_auto_capture: bool = True
 
-    # Open-Meteo (no key).
-    weather_base_url: str = "https://api.open-meteo.com/v1/forecast"
-    weather_cache_ttl_hours: float = 12.0
-    # Closer to kickoff the forecast is worth refreshing more often.
-    weather_gameday_cache_ttl_hours: float = 1.0
+    # --- The shared public-data service ----------------------------------------
+    # Player names, advanced stats, betting lines, injury reports, weather and
+    # the draft board all live in a separate service, reached over Railway's
+    # private network - see public_data/README.md. One instance is shared by
+    # every league backend.
+    public_data_url: str = "http://localhost:8100"
+    public_data_api_key: str = ""
+    public_data_timeout: float = 60.0
 
-    # HTTP.
+    # Sleeper API (league-specific calls: rosters, matchups, transactions,
+    # drafts). /players/nfl and /state/nfl are NOT called from here any more -
+    # those come from the public-data service.
     sleeper_base_url: str = "https://api.sleeper.app/v1"
     http_timeout: float = 20.0
-    players_http_timeout: float = 120.0
     http_max_retries: int = 3
 
     cors_origins: str = "*"

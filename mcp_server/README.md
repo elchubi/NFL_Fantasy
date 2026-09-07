@@ -227,7 +227,7 @@ propagation, the token path, and the Host header check.
 ## Project layout
 
 ```
-server.py            The MCP server: 21 tools, annotations, transport wiring
+server.py            The MCP server: 23 tools, annotations, transport wiring
 backend.py           HTTP client for the REST backend; holds BACKEND_API_KEY
 entrypoint.py        Binds the platform's PORT, and IPv6 for private networking
 railway.json         Railway build and healthcheck config

@@ -5,7 +5,6 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ.setdefault("LEAGUE_ID", "1390746710426255360")
 os.environ.setdefault("API_KEY", "test-key")
 
 import pytest  # noqa: E402

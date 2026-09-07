@@ -28,6 +28,14 @@ def _int(value: Any) -> int | None:
         return None
 
 
+def _expand(row: dict[str, Any]) -> dict[str, Any]:
+    """Merge the stored payload back over the extracted columns."""
+    payload = loads(row.get("payload")) or {}
+    merged = {k: v for k, v in row.items() if k != "payload"}
+    merged.update(payload)
+    return merged
+
+
 # --- League history (immutable) ----------------------------------------------
 
 
@@ -248,157 +256,6 @@ async def load_roster_snapshot(
     return [p for p in (loads(r["payload"]) for r in rows) if p]
 
 
-# --- Append-only histories ----------------------------------------------------
-#
-# These keep the JSONL semantics they replace: a row is written only when the
-# subject actually changed, so the sequence of rows is the history rather than a
-# pile of identical snapshots. The dedupe compares against the newest row for
-# the same subject in the same (season, week), which the indexes make cheap.
-
-ODDS_CHANGE_FIELDS = ("home_spread", "away_spread", "total", "favourite")
-INJURY_CHANGE_FIELDS = ("status", "practice_participation", "injury_type", "return_date")
-
-
-async def append_odds(
-    db: Database, season: int, week: int, games: list[dict[str, Any]]
-) -> dict[str, Any]:
-    latest = {
-        row["game_id"]: row
-        for row in await db.query(
-            """
-            SELECT o.* FROM odds_history o
-            JOIN (SELECT game_id, MAX(id) AS id FROM odds_history
-                  WHERE season=? AND week=? GROUP BY game_id) newest
-              ON o.id = newest.id
-            """,
-            (season, week),
-        )
-    }
-
-    captured, rows, skipped = _now(), [], 0
-    for game in games:
-        game_id = game.get("game_id")
-        if not game_id:
-            continue
-        previous = latest.get(game_id)
-        if previous and all(
-            _same(game.get(field), previous.get(field)) for field in ODDS_CHANGE_FIELDS
-        ):
-            skipped += 1
-            continue
-        rows.append(
-            (
-                captured, season, week, game_id,
-                game.get("home_team"), game.get("away_team"),
-                game.get("home_spread"), game.get("away_spread"),
-                game.get("total"), game.get("favourite"), dumps(game),
-            )
-        )
-
-    written = await db.execute_many(
-        """
-        INSERT INTO odds_history (captured_at, season, week, game_id, home_team,
-                                  away_team, home_spread, away_spread, total,
-                                  favourite, payload)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        rows,
-    )
-    return {"source": "odds", "written": len(rows) if written else 0, "skipped": skipped}
-
-
-async def append_injuries(
-    db: Database, season: int, week: int, entries: list[dict[str, Any]]
-) -> dict[str, Any]:
-    latest = {
-        (row["team"], row["name"]): row
-        for row in await db.query(
-            """
-            SELECT i.* FROM injury_history i
-            JOIN (SELECT team, name, MAX(id) AS id FROM injury_history
-                  WHERE season=? AND week=? GROUP BY team, name) newest
-              ON i.id = newest.id
-            """,
-            (season, week),
-        )
-    }
-
-    captured, rows, skipped = _now(), [], 0
-    for entry in entries:
-        team, name = entry.get("team"), entry.get("name")
-        if not team or not name:
-            continue
-        previous = latest.get((team, name))
-        if previous:
-            previous_payload = loads(previous.get("payload")) or {}
-            if all(
-                _same(entry.get(field), previous_payload.get(field))
-                for field in INJURY_CHANGE_FIELDS
-            ):
-                skipped += 1
-                continue
-        rows.append(
-            (
-                captured, season, week, team, entry.get("espn_id"), name,
-                entry.get("status"), entry.get("practice_participation"),
-                entry.get("injury_type"), dumps(entry),
-            )
-        )
-
-    written = await db.execute_many(
-        """
-        INSERT INTO injury_history (captured_at, season, week, team, espn_id, name,
-                                    status, practice_participation, injury_type, payload)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        rows,
-    )
-    return {"source": "injuries", "written": len(rows) if written else 0, "skipped": skipped}
-
-
-def _same(a: Any, b: Any) -> bool:
-    """Compare loosely, since SQLite hands back ints where JSON had floats."""
-    if a is None and b is None:
-        return True
-    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-        return abs(float(a) - float(b)) < 1e-9
-    return a == b
-
-
-async def read_odds(
-    db: Database, season: int, week: int | None = None, limit: int | None = None
-) -> list[dict[str, Any]]:
-    where, params = "WHERE season=?", [season]
-    if week is not None:
-        where += " AND week=?"
-        params.append(week)
-    sql = f"SELECT * FROM odds_history {where} ORDER BY id"  # noqa: S608
-    rows = await db.query(sql, params)
-    rows = rows[-limit:] if limit else rows
-    return [_expand(row) for row in rows]
-
-
-async def read_injuries(
-    db: Database, season: int, week: int | None = None, limit: int | None = None
-) -> list[dict[str, Any]]:
-    where, params = "WHERE season=?", [season]
-    if week is not None:
-        where += " AND week=?"
-        params.append(week)
-    sql = f"SELECT * FROM injury_history {where} ORDER BY id"  # noqa: S608
-    rows = await db.query(sql, params)
-    rows = rows[-limit:] if limit else rows
-    return [_expand(row) for row in rows]
-
-
-def _expand(row: dict[str, Any]) -> dict[str, Any]:
-    """Merge the stored payload back over the extracted columns."""
-    payload = loads(row.get("payload")) or {}
-    merged = {k: v for k, v in row.items() if k != "payload"}
-    merged.update(payload)
-    return merged
-
-
 # --- Decision log -------------------------------------------------------------
 
 
@@ -461,8 +318,6 @@ async def inventory(db: Database) -> dict[str, Any]:
     """What the archive holds, per source and season."""
     result: dict[str, Any] = {}
     for source, table in (
-        ("odds", "odds_history"),
-        ("injuries", "injury_history"),
         ("decisions", "decisions"),
         ("transactions", "transactions"),
         ("draft_picks", "draft_picks"),
