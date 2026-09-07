@@ -14,7 +14,7 @@ import pytest  # noqa: E402
 from app import services  # noqa: E402
 from app.managers import build_profiles  # noqa: E402
 from app.players import PlayerStore, _slim  # noqa: E402
-from app.pressure import analyse_league, analyse_team  # noqa: E402
+from app.pressure import analyse_league, analyse_team, positional_balance  # noqa: E402
 from tests import fixtures  # noqa: E402
 
 ROSTER_POSITIONS = ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "K", "DEF", "BN", "BN"]
@@ -135,6 +135,21 @@ def test_thin_positions_are_reported_without_inflating_the_score():
     assert "K" not in thin and "DEF" not in thin
     assert report["by_week"][0]["can_field_a_lineup"] is True
     assert report["pressure_score"] == 0
+
+
+def test_positional_balance_surfaces_surplus_that_thin_positions_hides():
+    """thin_positions only ever reports spare <= 0 - a team with real bench
+    depth at a position simply never appears in it, so trade-fit matching
+    needs the full picture instead."""
+    team = _team(
+        "Deep at RB",
+        FULL_LINEUP,
+        bench=[_p("RB3", "RB", "NYJ"), _p("RB4", "RB", "LAC"), _p("RB5", "RB", "LV")],
+    )
+    balance = {b["position"]: b for b in positional_balance(team, SLOTS)}
+    assert balance["RB"]["spare"] == 3
+    assert balance["QB"]["spare"] == 0
+    assert "K" not in balance and "DEF" not in balance
 
 
 def test_league_report_ranks_the_most_pressured_first():

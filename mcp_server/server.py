@@ -501,6 +501,29 @@ async def manager_playoff_odds(league: str | None = None, trials: int = 3000) ->
 
 
 @mcp.tool(
+    name="manager_trade_fits",
+    annotations=READ_ONLY,
+    description=(
+        "Who to approach for a trade, and about what position: crosses your "
+        "thin positions (no spare healthy body beyond your starters) against "
+        "every other team's surplus at that position, weighted by their "
+        "playoff odds (sellers ranked first) and their trade history with you. "
+        "Use this once you know what you need - manager_pressure or a roster "
+        "read tells you that - to shortlist who actually has it to give."
+    ),
+)
+async def manager_trade_fits(manager: str, league: str | None = None) -> Any:
+    """
+    Args:
+        manager: Username, display name or team name - your own team.
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
+    """
+    lid = _resolve_league(league)
+    return await _get(f"/leagues/{lid}/trade-fits/{manager}")
+
+
+@mcp.tool(
     name="decision_log",
     annotations=APPEND_ONLY,
     description=(
@@ -837,6 +860,7 @@ TOOL_NAMES = [
     "stats_advanced", "stats_odds", "stats_injury_report_team",
     "stats_injury_report_player", "stats_weather", "stats_stadiums",
     "manager_list", "manager_profile", "manager_pressure", "manager_playoff_odds",
+    "manager_trade_fits",
     "decision_log", "decision_log_outcome", "decision_list",
     "draft_class", "draft_prospect",
     "history_backfill", "history_seasons",

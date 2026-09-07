@@ -25,7 +25,7 @@ from app.history import decision_row, outcome_row
 from app.managers import build_profiles
 from app.players import PlayerStore
 from app import playoffs
-from app.pressure import analyse_league
+from app.pressure import analyse_league, positional_balance
 from app.public_client import PublicDataClient
 from app.security import require_api_key
 from app import store
@@ -804,6 +804,62 @@ async def pressure(
     }
 
 
+async def _simulate_playoff_odds(
+    lid: str,
+    fetched: dict[str, Any],
+    teams: dict[Any, dict[str, Any]],
+    current: int,
+    trials: int = 1500,
+) -> tuple[dict[Any, float], dict[Any, dict[str, float]], int, list[int]]:
+    """Shared by /playoff-odds and /trade-fits: each roster's playoff odds and
+    scoring profile, plus the playoff start week and the weeks simulated."""
+    league_settings = fetched.get("settings") or {}
+    playoff_spots = int(league_settings.get("playoff_teams") or 6)
+    playoff_start = int(league_settings.get("playoff_week_start") or 15)
+
+    weeks_played = list(range(1, current))
+    weeks_remaining = [w for w in range(current, playoff_start) if w >= 1]
+
+    history_pages, remaining_pages = await asyncio.gather(
+        asyncio.gather(*[client.matchups(lid, w) for w in weeks_played]),
+        asyncio.gather(*[client.matchups(lid, w) for w in weeks_remaining]),
+    )
+
+    weekly_scores: dict[Any, list[float]] = {rid: [] for rid in teams}
+    for page in history_pages:
+        for entry in page:
+            rid = entry.get("roster_id")
+            points = entry.get("points")
+            if rid in weekly_scores and points:
+                weekly_scores[rid].append(float(points))
+
+    remaining_matchups: list[list[tuple[Any, Any]]] = []
+    for page in remaining_pages:
+        by_matchup: dict[Any, list[Any]] = {}
+        for entry in page:
+            matchup_id = entry.get("matchup_id")
+            rid = entry.get("roster_id")
+            if matchup_id is not None and rid is not None:
+                by_matchup.setdefault(matchup_id, []).append(rid)
+        remaining_matchups.append(
+            [tuple(pair) for pair in by_matchup.values() if len(pair) == 2]
+        )
+
+    standings = {
+        rid: {
+            "wins": team["record"]["wins"],
+            "losses": team["record"]["losses"],
+            "points_for": team["record"]["points_for"],
+        }
+        for rid, team in teams.items()
+    }
+    profiles = playoffs.team_scoring_profiles(weekly_scores)
+    odds = playoffs.simulate_playoff_odds(
+        profiles, standings, remaining_matchups, playoff_spots, trials=trials
+    )
+    return odds, profiles, playoff_start, weeks_remaining
+
+
 @app.get(
     "/leagues/{league}/playoff-odds",
     tags=["edge"],
@@ -833,50 +889,9 @@ async def playoff_odds(
         client.nfl_state(), client.league(lid), client.users(lid), client.rosters(lid)
     )
     teams = services.build_teams(users, rosters)
-    league_settings = fetched.get("settings") or {}
-    playoff_spots = int(league_settings.get("playoff_teams") or 6)
-    playoff_start = int(league_settings.get("playoff_week_start") or 15)
     current = services.current_week(state)
-
-    weeks_played = list(range(1, current))
-    weeks_remaining = [w for w in range(current, playoff_start) if w >= 1]
-
-    history_pages, remaining_pages = await asyncio.gather(
-        asyncio.gather(*[client.matchups(lid, w) for w in weeks_played]),
-        asyncio.gather(*[client.matchups(lid, w) for w in weeks_remaining]),
-    )
-
-    weekly_scores: dict[int, list[float]] = {rid: [] for rid in teams}
-    for page in history_pages:
-        for entry in page:
-            rid = entry.get("roster_id")
-            points = entry.get("points")
-            if rid in weekly_scores and points:
-                weekly_scores[rid].append(float(points))
-
-    remaining_matchups: list[list[tuple[int, int]]] = []
-    for page in remaining_pages:
-        by_matchup: dict[Any, list[int]] = {}
-        for entry in page:
-            matchup_id = entry.get("matchup_id")
-            rid = entry.get("roster_id")
-            if matchup_id is not None and rid is not None:
-                by_matchup.setdefault(matchup_id, []).append(rid)
-        remaining_matchups.append(
-            [tuple(pair) for pair in by_matchup.values() if len(pair) == 2]
-        )
-
-    standings = {
-        rid: {
-            "wins": team["record"]["wins"],
-            "losses": team["record"]["losses"],
-            "points_for": team["record"]["points_for"],
-        }
-        for rid, team in teams.items()
-    }
-    profiles = playoffs.team_scoring_profiles(weekly_scores)
-    odds = playoffs.simulate_playoff_odds(
-        profiles, standings, remaining_matchups, playoff_spots, trials=trials
+    odds, profiles, playoff_start, weeks_remaining = await _simulate_playoff_odds(
+        lid, fetched, teams, current, trials=trials
     )
 
     report = [
@@ -896,10 +911,108 @@ async def playoff_odds(
     return {
         "current_week": current,
         "playoff_week_start": playoff_start,
-        "playoff_spots": playoff_spots,
+        "playoff_spots": int((fetched.get("settings") or {}).get("playoff_teams") or 6),
         "weeks_simulated": weeks_remaining,
         "trials": trials,
         "teams": report,
+    }
+
+
+@app.get(
+    "/leagues/{league}/trade-fits/{manager}",
+    tags=["edge"],
+    dependencies=[Depends(require_api_key)],
+    summary="Who to approach for a trade, and about what position",
+)
+async def trade_fits(
+    league: str = Path(description="A slug from GET /leagues."),
+    manager: str = Path(description="Username, display name or team name."),
+) -> dict[str, Any]:
+    """Crosses your positional deficits against every other team's surplus at
+    that position, weighted by their playoff odds and their trade history
+    with you, to shortlist who to approach and about what.
+
+    A deficit here is a position with no spare healthy body beyond the
+    starters it fills (the same read /pressure uses); a surplus is the
+    opposite - extra healthy depth nobody else can see because a raw record
+    or roster listing does not compute it. Sellers (long playoff odds) are
+    ranked first, since they are the likeliest to actually move a surplus
+    player rather than sit on him as insurance.
+    """
+    await players.ensure_fresh()
+    lid = settings.league_id_for(league)
+    state, fetched, users, rosters = await asyncio.gather(
+        client.nfl_state(), client.league(lid), client.users(lid), client.rosters(lid)
+    )
+    teams = services.build_teams(users, rosters)
+    match = _match_team_or_404(teams, manager)
+    roster_positions = fetched.get("roster_positions") or []
+    resolved_by_roster = {
+        r.get("roster_id"): services.resolve_roster(
+            r, teams.get(r.get("roster_id"), {}), roster_positions, players
+        )
+        for r in rosters
+    }
+
+    my_balance = positional_balance(resolved_by_roster[match["roster_id"]], roster_positions)
+    my_deficits = [b["position"] for b in my_balance if b["spare"] <= 0]
+    if not my_deficits:
+        return {
+            "matched_on": manager,
+            "your_deficits": [],
+            "candidates": [],
+            "note": "No thin positions right now - nothing urgent to trade for.",
+        }
+
+    current = services.current_week(state)
+    odds, _profiles, _playoff_start, _weeks = await _simulate_playoff_odds(
+        lid, fetched, teams, current, trials=1500
+    )
+    manager_data = await managers(league=league, seasons=None, days=None)
+    trade_partners_by_roster = {
+        m["roster_id"]: m.get("trade_partners") or {} for m in manager_data.get("managers", [])
+    }
+    my_trade_partners = trade_partners_by_roster.get(match["roster_id"], {})
+
+    candidates = []
+    for rid, team in teams.items():
+        if rid == match["roster_id"]:
+            continue
+        their_balance = {
+            b["position"]: b for b in positional_balance(resolved_by_roster[rid], roster_positions)
+        }
+        fits = [
+            {"position": position, "their_spare": their_balance[position]["spare"]}
+            for position in my_deficits
+            if position in their_balance and their_balance[position]["spare"] > 0
+        ]
+        if not fits:
+            continue
+        their_odds = odds.get(rid, 0.0)
+        candidates.append(
+            {
+                "roster_id": rid,
+                "display_name": team["display_name"],
+                "team_name": team["team_name"],
+                "playoff_odds": their_odds,
+                "read": playoffs.classify(their_odds),
+                "positions_they_can_fill_for_you": fits,
+                "past_trades_with_you": my_trade_partners.get(str(rid), 0),
+            }
+        )
+    candidates.sort(
+        key=lambda c: (
+            c["read"] == "seller",
+            len(c["positions_they_can_fill_for_you"]),
+            c["past_trades_with_you"],
+        ),
+        reverse=True,
+    )
+
+    return {
+        "matched_on": manager,
+        "your_deficits": my_deficits,
+        "candidates": candidates,
     }
 
 

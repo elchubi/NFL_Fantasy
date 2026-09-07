@@ -185,30 +185,56 @@ def _shortfalls(
     return missing
 
 
-def _thin_positions(
-    roster: list[dict[str, Any]], required: list[tuple[str, tuple[str, ...]]]
-) -> list[dict[str, Any]]:
-    """Positions with no healthy cover beyond the starters they must fill."""
+def _dedicated_slot_counts(required: list[tuple[str, tuple[str, ...]]]) -> dict[str, int]:
     dedicated: dict[str, int] = {}
     for slot, eligible in required:
         if len(eligible) == 1:
             dedicated[eligible[0]] = dedicated.get(eligible[0], 0) + 1
+    return dedicated
 
-    thin = []
-    for position, needed in sorted(dedicated.items()):
+
+def _position_balance(
+    roster: list[dict[str, Any]], required: list[tuple[str, tuple[str, ...]]]
+) -> list[dict[str, Any]]:
+    """Healthy depth at every dedicated-slot position, deficit or surplus."""
+    balance = []
+    for position, needed in sorted(_dedicated_slot_counts(required).items()):
         if position in STREAMED_POSITIONS:
             continue
         healthy = [p for p in roster if p.get("position") == position and not _is_out(p)]
-        if len(healthy) <= needed:
-            thin.append(
-                {
-                    "position": position,
-                    "healthy": len(healthy),
-                    "starters_required": needed,
-                    "spare": len(healthy) - needed,
-                }
-            )
-    return thin
+        balance.append(
+            {
+                "position": position,
+                "healthy": len(healthy),
+                "starters_required": needed,
+                "spare": len(healthy) - needed,
+            }
+        )
+    return balance
+
+
+def _thin_positions(
+    roster: list[dict[str, Any]], required: list[tuple[str, tuple[str, ...]]]
+) -> list[dict[str, Any]]:
+    """Positions with no healthy cover beyond the starters they must fill."""
+    return [b for b in _position_balance(roster, required) if b["spare"] <= 0]
+
+
+def positional_balance(team: dict[str, Any], roster_positions: list[str]) -> list[dict[str, Any]]:
+    """Healthy depth at every dedicated-slot position for one resolved team.
+
+    Unlike `thin_positions` in `analyse_team` (which only reports positions
+    with no spare healthy body), this includes every position, so a surplus -
+    the other half of a trade - is visible too. Used to match one team's
+    deficit against another's surplus.
+
+    `roster_positions` is the league's raw starting-lineup setting (bench/IR/
+    taxi slots included, same as Sleeper returns it and same as what
+    `analyse_league` takes) - filtered to starting slots here, so the caller
+    does not have to know about that detail.
+    """
+    slots = [p for p in roster_positions if p not in NON_STARTING_SLOTS]
+    return _position_balance(_roster_players(team), _slot_requirements(slots))
 
 
 def _score(
