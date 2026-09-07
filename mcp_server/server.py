@@ -227,6 +227,67 @@ async def league_roster(manager: str, league: str | None = None) -> Any:
     return await _get(f"/leagues/{lid}/roster/{manager}")
 
 
+@mcp.tool(
+    name="waivers_available",
+    annotations=READ_ONLY,
+    description=(
+        "Every free agent in this league - nobody's roster - ranked by recent role "
+        "trend and points scored under this league's own scoring settings, not a "
+        "generic PPR ranking. This is the actual waiver-wire question ('who do I "
+        "add') answered against who is really still out there in this league, not "
+        "a public top-100 list that ignores who your league has already rostered."
+    ),
+)
+async def waivers_available(
+    league: str | None = None,
+    position: str | None = None,
+    limit: int = 25,
+    season: int | None = None,
+) -> Any:
+    """
+    Args:
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
+        position: QB, RB, WR or TE. Omit to check all four.
+        limit: Top N per position (1-100).
+        season: Defaults to the current season.
+    """
+    lid = _resolve_league(league)
+    return await _get(
+        f"/leagues/{lid}/available",
+        params={"position": position, "limit": limit, "season": season},
+    )
+
+
+@mcp.tool(
+    name="schedule_difficulty",
+    annotations=READ_ONLY,
+    description=(
+        "For each of a roster's QB/RB/WR/TE, how many fantasy points its next few "
+        "opponents have allowed at that position this season, under this league's "
+        "own scoring rules - not the opponent's real-world defensive rank. Use it "
+        "to break a close start/sit or trade-value call between two similar "
+        "players: the one with the softer slate ahead is worth more right now."
+    ),
+)
+async def schedule_difficulty(
+    manager: str, league: str | None = None, weeks_ahead: int = 4, season: int | None = None
+) -> Any:
+    """
+    Args:
+        manager: Username, display name or team name. Partial matches are fine.
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
+        weeks_ahead: How many upcoming weeks to check (1-10).
+        season: Defaults to the current season.
+    """
+    lid = _resolve_league(league)
+    return await _get(
+        f"/leagues/{lid}/schedule-difficulty/{manager}",
+        params={"weeks_ahead": weeks_ahead, "season": season},
+    )
+
+
 # --- External sources ---------------------------------------------------------
 
 
@@ -747,7 +808,8 @@ async def healthz(request: Any) -> JSONResponse:
 
 TOOL_NAMES = [
     "league_list",
-    "league_snapshot", "league_settings", "league_roster",
+    "league_snapshot", "league_settings", "league_roster", "waivers_available",
+    "schedule_difficulty",
     "stats_advanced", "stats_odds", "stats_injury_report_team",
     "stats_injury_report_player", "stats_weather", "stats_stadiums",
     "manager_list", "manager_profile", "manager_pressure",

@@ -233,38 +233,7 @@ async def roster(
     )
 
     teams = services.build_teams(users, rosters)
-    match, candidates = services.find_team(teams, manager)
-
-    if match is None:
-        if candidates:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "message": f"'{manager}' matches more than one team.",
-                    "candidates": [
-                        {
-                            "display_name": c["display_name"],
-                            "team_name": c["team_name"],
-                            "roster_id": c["roster_id"],
-                        }
-                        for c in candidates
-                    ],
-                },
-            )
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "message": f"No team matches '{manager}'.",
-                "available": [
-                    {
-                        "display_name": t["display_name"],
-                        "team_name": t["team_name"],
-                        "roster_id": t["roster_id"],
-                    }
-                    for t in teams.values()
-                ],
-            },
-        )
+    match = _match_team_or_404(teams, manager)
 
     raw_roster = next(
         (r for r in rosters if r.get("roster_id") == match["roster_id"]), {}
@@ -278,6 +247,197 @@ async def roster(
         "matched_on": manager,
         "team": resolved,
         "players_cache": players.status(),
+    }
+
+
+_SKILL_POSITIONS = ("QB", "RB", "WR", "TE")
+
+
+@app.get(
+    "/leagues/{league}/available",
+    tags=["edge"],
+    dependencies=[Depends(require_api_key)],
+    summary="Free agents ranked by role trend and points in this league's own scoring",
+)
+async def available_players(
+    league: str = Path(description="A slug from GET /leagues."),
+    position: str | None = Query(
+        default=None, description="QB, RB, WR or TE. Omit to check all four."
+    ),
+    limit: int = Query(default=25, ge=1, le=100, description="Top N per position."),
+    season: int | None = Query(default=None, ge=1999, le=2100),
+) -> dict[str, Any]:
+    """Every rostered-nowhere skill player in this league, ranked by recent
+    role trend and points scored under this league's own `scoring_settings` -
+    not nflverse's fixed PPR column, which rarely matches a real league's
+    rules. This is the list nobody else in the league is looking at: a
+    general fantasy tool ranks players against a generic scoring system, not
+    against who is actually still on your waiver wire.
+    """
+    positions = [position.upper()] if position else list(_SKILL_POSITIONS)
+    for p in positions:
+        if p not in _SKILL_POSITIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{p}' is not a skill position. Use one of: {', '.join(_SKILL_POSITIONS)}.",
+            )
+
+    await players.ensure_fresh()
+    lid = settings.league_id_for(league)
+    fetched, rosters = await asyncio.gather(client.league(lid), client.rosters(lid))
+    scoring_settings = fetched.get("scoring_settings") or {}
+    target_season = season or (
+        int(fetched["season"]) if fetched.get("season") else await current_season()
+    )
+
+    rostered: set[str] = set()
+    for roster in rosters:
+        rostered.update(str(pid) for pid in (roster.get("players") or []))
+
+    payloads = await asyncio.gather(
+        *[
+            public.post(
+                f"/position-points/{p}",
+                params={"season": target_season},
+                json={"scoring_settings": scoring_settings},
+            )
+            for p in positions
+        ]
+    )
+
+    scoring_not_applied: set[str] = set()
+    pool: dict[str, list[dict[str, Any]]] = {}
+    for p, payload in zip(positions, payloads):
+        scoring_not_applied.update(payload.get("scoring_not_applied") or [])
+        candidates: list[dict[str, Any]] = []
+        for entry in payload.get("players") or []:
+            sleeper_id = players.sleeper_id_for_gsis(entry["gsis_id"])
+            if sleeper_id is None or sleeper_id in rostered:
+                continue
+            resolved = players.resolve(sleeper_id)
+            candidates.append(
+                {
+                    "player_id": sleeper_id,
+                    "name": resolved.get("name"),
+                    "position": p,
+                    "nfl_team": entry.get("team"),
+                    "injury_status": resolved.get("injury_status"),
+                    "games": entry.get("games"),
+                    "season_total_points": entry.get("season_total_points"),
+                    "season_average_points": entry.get("season_average_points"),
+                    "recent_average_points": entry.get("recent_average_points"),
+                }
+            )
+        candidates.sort(key=lambda c: c["recent_average_points"] or 0, reverse=True)
+        pool[p] = candidates[:limit]
+
+    return {
+        "season": target_season,
+        "rostered_players": len(rostered),
+        "scoring_not_applied": sorted(scoring_not_applied),
+        "available": pool,
+    }
+
+
+@app.get(
+    "/leagues/{league}/schedule-difficulty/{manager}",
+    tags=["edge"],
+    dependencies=[Depends(require_api_key)],
+    summary="How soft or hard a roster's remaining schedule is, by player",
+)
+async def schedule_difficulty(
+    league: str = Path(description="A slug from GET /leagues."),
+    manager: str = Path(description="Username, display name or team name."),
+    weeks_ahead: int = Query(
+        default=4, ge=1, le=10, description="How many upcoming weeks to check."
+    ),
+    season: int | None = Query(default=None, ge=1999, le=2100),
+) -> dict[str, Any]:
+    """For each of a roster's QB/RB/WR/TE, how many fantasy points its next
+    few opponents have allowed at that position this season, under this
+    league's own scoring rules - not the opponent's real-world defensive
+    rank. Useful for a close start/sit or trade-value call between two
+    otherwise similar players: the one with the softer slate ahead is worth
+    more right now.
+    """
+    await players.ensure_fresh()
+    lid = settings.league_id_for(league)
+    state, fetched, users, rosters = await asyncio.gather(
+        client.nfl_state(), client.league(lid), client.users(lid), client.rosters(lid)
+    )
+    teams = services.build_teams(users, rosters)
+    match = _match_team_or_404(teams, manager)
+    raw_roster = next(
+        (r for r in rosters if r.get("roster_id") == match["roster_id"]), {}
+    )
+    skill_players = [
+        resolved
+        for pid in (raw_roster.get("players") or [])
+        if (resolved := players.resolve(pid)).get("position") in _SKILL_POSITIONS
+    ]
+
+    scoring_settings = fetched.get("scoring_settings") or {}
+    target_season = season or (
+        int(fetched["season"]) if fetched.get("season") else await current_season()
+    )
+    current = services.current_week(state)
+    target_weeks = list(range(current, current + weeks_ahead))
+    needed_positions = sorted({p["position"] for p in skill_players})
+
+    schedule_payload, allowed_payloads = await asyncio.gather(
+        public.get(f"/schedule/{target_season}"),
+        asyncio.gather(
+            *[
+                public.post(
+                    f"/points-allowed/{p}",
+                    params={"season": target_season},
+                    json={"scoring_settings": scoring_settings},
+                )
+                for p in needed_positions
+            ]
+        ),
+    )
+    opponents_by_team = schedule_payload.get("opponents") or {}
+    stinginess_by_position = {
+        p: {t["team"]: t for t in payload.get("teams") or []}
+        for p, payload in zip(needed_positions, allowed_payloads)
+    }
+
+    report = []
+    for player in skill_players:
+        team = player.get("nfl_team")
+        position = player.get("position")
+        team_opponents = opponents_by_team.get(team) or {}
+        weekly = []
+        for week in target_weeks:
+            opponent = team_opponents.get(str(week))
+            if opponent is None:
+                weekly.append({"week": week, "opponent": None, "note": "bye"})
+                continue
+            defense = stinginess_by_position.get(position, {}).get(opponent)
+            weekly.append(
+                {
+                    "week": week,
+                    "opponent": opponent,
+                    "average_points_allowed": defense.get("average_points_allowed") if defense else None,
+                    "rank_stingiest": defense.get("rank_stingiest") if defense else None,
+                }
+            )
+        report.append(
+            {
+                "player_id": player.get("player_id"),
+                "name": player.get("name"),
+                "position": position,
+                "nfl_team": team,
+                "weeks": weekly,
+            }
+        )
+
+    return {
+        "season": target_season,
+        "weeks_checked": target_weeks,
+        "matched_on": manager,
+        "players": report,
     }
 
 
@@ -496,6 +656,43 @@ async def managers(
         "injury_history_rows": len(injury_history),
         **profiles,
     }
+
+
+def _match_team_or_404(teams: dict[Any, dict[str, Any]], manager: str) -> dict[str, Any]:
+    """The one team `manager` matches, or a 404/409 shaped like every other
+    manager-lookup endpoint here."""
+    match, candidates = services.find_team(teams, manager)
+    if match is not None:
+        return match
+    if candidates:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"'{manager}' matches more than one team.",
+                "candidates": [
+                    {
+                        "display_name": c["display_name"],
+                        "team_name": c["team_name"],
+                        "roster_id": c["roster_id"],
+                    }
+                    for c in candidates
+                ],
+            },
+        )
+    raise HTTPException(
+        status_code=404,
+        detail={
+            "message": f"No team matches '{manager}'.",
+            "available": [
+                {
+                    "display_name": t["display_name"],
+                    "team_name": t["team_name"],
+                    "roster_id": t["roster_id"],
+                }
+                for t in teams.values()
+            ],
+        },
+    )
 
 
 def _parse_seasons(raw: str | None) -> list[int]:

@@ -62,6 +62,24 @@ class ScheduleProvider:
         data, _ = await self.season(season)
         return data.get("byes") or {}
 
+    async def opponents(self, season: int) -> dict[str, dict[int, str]]:
+        """team abbreviation -> {week: opponent abbreviation}.
+
+        Built from the same schedule rows `byes` uses. This is what turns
+        "points allowed by position" into an actual per-player schedule
+        difficulty view - which weeks are soft, which are hard, for the
+        specific opponents a roster still has left.
+        """
+        data, _ = await self.season(season)
+        by_team: dict[str, dict[int, str]] = {}
+        for game in data.get("games") or []:
+            home, away, week = game.get("home_team"), game.get("away_team"), game.get("week")
+            if not home or not away or week is None:
+                continue
+            by_team.setdefault(home, {})[week] = away
+            by_team.setdefault(away, {})[week] = home
+        return by_team
+
 
 def _parse_schedule(path: Path, season: int) -> dict[str, Any]:
     weeks: set[int] = set()

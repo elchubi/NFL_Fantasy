@@ -41,17 +41,28 @@ class PublicDataClient:
     async def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return await self._request("GET", path, params)
 
-    async def post(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        return await self._request("POST", path, params)
+    async def post(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+    ) -> Any:
+        return await self._request("POST", path, params, json)
 
     async def _request(
-        self, method: str, path: str, params: dict[str, Any] | None
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None,
+        json: dict[str, Any] | None = None,
     ) -> Any:
         clean = {k: v for k, v in (params or {}).items() if v is not None}
         headers = {"X-API-Key": self.api_key} if self.api_key else {}
 
         try:
-            response = await self._client.request(method, path, params=clean, headers=headers)
+            response = await self._client.request(
+                method, path, params=clean, json=json, headers=headers
+            )
         except httpx.TimeoutException as exc:
             raise HTTPException(
                 status_code=504,

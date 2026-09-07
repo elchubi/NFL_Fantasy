@@ -103,6 +103,94 @@ def test_summary_exposes_the_trend_against_the_season(tmp_path):
     assert jefferson["weeks"]["2"]["week"] == 2
 
 
+async def test_position_points_scores_every_player_at_a_position(tmp_path):
+    """Reuses the same cached weekly rows /advanced-stats already parses, just
+    scored under the caller's own scoring_settings instead of nflverse's fixed
+    PPR column - and does not touch players at other positions."""
+    provider = nflverse.NflverseProvider.__new__(nflverse.NflverseProvider)
+
+    async def fake_season_data(season):
+        return (
+            {
+                "season": season,
+                "players": {
+                    "00-0034796": {
+                        "name": "Christian McCaffrey",
+                        "position": "RB",
+                        "team": "SF",
+                        "games": 2,
+                        "weeks": {
+                            "1": {"rushing_yards": 100, "rushing_tds": 1},
+                            "2": {"rushing_yards": 50},
+                        },
+                    },
+                    "00-0036322": {
+                        "name": "Justin Jefferson",
+                        "position": "WR",
+                        "team": "MIN",
+                        "games": 1,
+                        "weeks": {"1": {"receptions": 6, "receiving_yards": 80}},
+                    },
+                },
+            },
+            {},
+        )
+
+    provider.season_data = fake_season_data
+
+    result = await provider.position_points("rb", 2025, {"rush_yd": 0.1, "rush_td": 6})
+    assert result["position"] == "RB"
+    assert len(result["players"]) == 1
+    cmc = result["players"][0]
+    assert cmc["gsis_id"] == "00-0034796"
+    # week 1: 100*0.1 + 6 = 16; week 2: 50*0.1 = 5
+    assert cmc["weekly_points"] == {"1": 16.0, "2": 5.0}
+    assert cmc["season_total_points"] == 21.0
+
+
+async def test_points_allowed_aggregates_by_opponent_not_by_player():
+    """Two different RBs who both played CHI should sum into CHI's total -
+    that is the whole point of "points allowed" over a raw player ranking."""
+    provider = nflverse.NflverseProvider.__new__(nflverse.NflverseProvider)
+
+    async def fake_season_data(season):
+        return (
+            {
+                "season": season,
+                "players": {
+                    "rb1": {
+                        "position": "RB",
+                        "weeks": {"1": {"opponent": "CHI", "rushing_yards": 100}},
+                    },
+                    "rb2": {
+                        "position": "RB",
+                        "weeks": {"1": {"opponent": "CHI", "rushing_yards": 50}},
+                    },
+                    "rb3": {
+                        "position": "RB",
+                        "weeks": {"1": {"opponent": "DAL", "rushing_yards": 20}},
+                    },
+                    # Different position entirely; must not leak into RB totals.
+                    "wr1": {
+                        "position": "WR",
+                        "weeks": {"1": {"opponent": "CHI", "receiving_yards": 200}},
+                    },
+                },
+            },
+            {},
+        )
+
+    provider.season_data = fake_season_data
+    result = await provider.points_allowed("rb", 2025, {"rush_yd": 0.1})
+
+    by_team = {t["team"]: t for t in result["teams"]}
+    assert by_team["CHI"]["total_points_allowed"] == 15.0  # (100+50)*0.1
+    assert by_team["DAL"]["total_points_allowed"] == 2.0
+    # The stingier defense (fewer points allowed) ranks first.
+    assert result["teams"][0]["team"] == "DAL"
+    assert result["teams"][0]["rank_stingiest"] == 1
+
+
 def test_trend_is_withheld_until_there_are_enough_games(tmp_path):
     """A 2-game sample would otherwise report a flat trend, which reads as
     "role is stable" when it actually means "not enough data"."""

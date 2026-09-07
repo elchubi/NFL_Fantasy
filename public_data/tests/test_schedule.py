@@ -6,7 +6,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("API_KEY", "test-key")
 
-from app.schedule import _parse_schedule  # noqa: E402
+import pytest  # noqa: E402
+
+from app.schedule import ScheduleProvider, _parse_schedule  # noqa: E402
 
 SCHEDULE_CSV = """game_id,season,game_type,week,gameday,weekday,gametime,away_team,home_team
 2026_01_A,2026,REG,1,2026-09-10,Thursday,20:20,KC,SF
@@ -34,3 +36,20 @@ def test_byes_are_the_weeks_a_team_does_not_appear(tmp_path):
     # Playoff games and other seasons are excluded.
     assert all(g["week"] <= 3 for g in parsed["games"])
     assert len(parsed["games"]) == 5
+
+
+async def test_opponents_are_derived_from_both_sides_of_each_game(tmp_path):
+    path = tmp_path / "g.csv"
+    path.write_text(SCHEDULE_CSV, encoding="utf-8")
+    provider = ScheduleProvider.__new__(ScheduleProvider)
+
+    async def fake_season(season):
+        return _parse_schedule(path, season), {}
+
+    provider.season = fake_season
+    opponents = await provider.opponents(2026)
+
+    assert opponents["SF"] == {1: "KC", 2: "GB"}
+    assert opponents["KC"] == {1: "SF", 2: "MIN", 3: "GB"}
+    # SF's bye week (3) simply has no entry, same as a missing week anywhere else.
+    assert 3 not in opponents["SF"]

@@ -33,13 +33,14 @@ from typing import Any
 import httpx
 from fastapi import HTTPException
 
+from app import scoring
 from app.cache import KeyedDiskCache
 from app.config import get_settings
 from app.http import download_to_file
 
 log = logging.getLogger(__name__)
 
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 
 # Weekly columns worth keeping, mapped to the names we serve.
 WEEKLY_FIELDS: dict[str, str] = {
@@ -57,11 +58,15 @@ WEEKLY_FIELDS: dict[str, str] = {
     "wopr": "wopr",
     "racr": "racr",
     "receiving_epa": "receiving_epa",
+    "receiving_fumbles_lost": "receiving_fumbles_lost",
+    "receiving_2pt_conversions": "receiving_2pt_conversions",
     # Rushing
     "carries": "carries",
     "rushing_yards": "rushing_yards",
     "rushing_tds": "rushing_tds",
     "rushing_epa": "rushing_epa",
+    "rushing_fumbles_lost": "rushing_fumbles_lost",
+    "rushing_2pt_conversions": "rushing_2pt_conversions",
     # Passing
     "attempts": "pass_attempts",
     "completions": "completions",
@@ -69,6 +74,9 @@ WEEKLY_FIELDS: dict[str, str] = {
     "passing_tds": "passing_tds",
     "passing_air_yards": "passing_air_yards",
     "passing_epa": "passing_epa",
+    "interceptions": "interceptions",
+    "sack_fumbles_lost": "sack_fumbles_lost",
+    "passing_2pt_conversions": "passing_2pt_conversions",
     # Fantasy
     "fantasy_points_ppr": "fantasy_points_ppr",
 }
@@ -171,6 +179,94 @@ class NflverseProvider:
             if data.get("players"):
                 self._resolved_season[requested] = previous
         return data, meta
+
+    async def position_points(
+        self, position: str, season: int, scoring_settings: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Every player at `position` scored under a league's own scoring_settings.
+
+        Reuses the cached weekly stats `season_data` already holds - this adds
+        no extra download or parse, just a different aggregation over the same
+        rows. This is what a league-specific view (free agent rankings,
+        points allowed by position) is built from, since nflverse's own
+        `fantasy_points_ppr` column bakes in fixed PPR rules that rarely match
+        a real league's settings.
+        """
+        position = position.upper()
+        data, meta = await self.season_data(season)
+        not_applied: set[str] = set()
+        players: list[dict[str, Any]] = []
+        for gsis, player in data.get("players", {}).items():
+            if (player.get("position") or "").upper() != position:
+                continue
+            scored = scoring.season_points(player, scoring_settings)
+            players.append({
+                "gsis_id": gsis,
+                "name": player.get("name"),
+                "team": player.get("team"),
+                "position": player.get("position"),
+                "games": player.get("games"),
+                **scored,
+            })
+        not_applied.update(scoring.unsupported_keys(scoring_settings))
+        players.sort(key=lambda p: p["season_total_points"] or 0, reverse=True)
+        return {
+            "season": data.get("season"),
+            "position": position,
+            "scoring_not_applied": sorted(not_applied),
+            "players": players,
+        }
+
+    async def points_allowed(
+        self, position: str, season: int, scoring_settings: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Fantasy points each NFL defense has allowed to a position, under a
+        league's own scoring_settings.
+
+        Same source rows as `position_points`, aggregated the other way: by
+        the opponent a player faced each week rather than by the player
+        himself. This is what "strength of schedule" actually means for a
+        fantasy roster - not a team's real-world defensive rank, but how many
+        fantasy points it has given up at the position in question.
+        """
+        position = position.upper()
+        data, meta = await self.season_data(season)
+        allowed: dict[str, dict[str, float]] = defaultdict(dict)
+        for player in data.get("players", {}).values():
+            if (player.get("position") or "").upper() != position:
+                continue
+            for week_num, row in player.get("weeks", {}).items():
+                opponent = row.get("opponent")
+                if not opponent:
+                    continue
+                points = scoring.compute_points(row, scoring_settings, position)["points"]
+                week_key = str(week_num)
+                allowed[opponent][week_key] = allowed[opponent].get(week_key, 0.0) + points
+
+        teams: list[dict[str, Any]] = []
+        for team, weeks in allowed.items():
+            values = list(weeks.values())
+            games = len(values)
+            total = round(sum(values), 2)
+            teams.append({
+                "team": team,
+                "games": games,
+                "total_points_allowed": total,
+                "average_points_allowed": round(total / games, 2) if games else None,
+                "weekly_points_allowed": {w: round(p, 2) for w, p in weeks.items()},
+            })
+        # Stingiest defense against this position first - the one you least
+        # want your player facing next.
+        teams.sort(key=lambda t: t["average_points_allowed"] or 0)
+        for rank, team in enumerate(teams, start=1):
+            team["rank_stingiest"] = rank
+
+        return {
+            "season": data.get("season"),
+            "position": position,
+            "scoring_not_applied": sorted(scoring.unsupported_keys(scoring_settings)),
+            "teams": teams,
+        }
 
     # --- Aggregation ----------------------------------------------------------
 

@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Path, Query
+from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
@@ -151,6 +151,69 @@ async def advanced_stats(
     result = await nflverse.for_gsis_id(gsis, target_season)
     sleeper_player = players.resolve(player_id)
     return {"player": sleeper_player, "gsis_id": gsis, **result}
+
+
+@app.post(
+    "/position-points/{position}",
+    tags=["external"],
+    dependencies=[Depends(require_api_key)],
+    summary="Every player at a position, scored under a league's own rules",
+)
+async def position_points(
+    position: str = Path(description="QB, RB, WR or TE."),
+    season: int | None = Query(default=None, ge=1999, le=2100),
+    scoring_settings: dict[str, float] = Body(
+        embed=True,
+        description="A league's Sleeper scoring_settings, e.g. {\"rec\": 0.5, \"pass_td\": 4}.",
+    ),
+) -> dict[str, Any]:
+    """Weekly and season fantasy points for every player at one position,
+    computed from nflverse's raw stat counts under the caller's own scoring
+    rules rather than nflverse's fixed PPR column.
+
+    Not specific to any league beyond the `scoring_settings` passed in, so it
+    lives here rather than in a league backend - the weekly stats it reads are
+    already cached by `/advanced-stats`, so this adds no extra download.
+    Kicking, IDP and defense/special-teams scoring keys have no raw counting
+    stat in this data and are reported back in `scoring_not_applied` rather
+    than silently skipped.
+    """
+    if position.upper() not in {"QB", "RB", "WR", "TE"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{position}' is not a skill position. Use one of: QB, RB, WR, TE.",
+        )
+    target_season = season or await current_season()
+    return await nflverse.position_points(position, target_season, scoring_settings)
+
+
+@app.post(
+    "/points-allowed/{position}",
+    tags=["external"],
+    dependencies=[Depends(require_api_key)],
+    summary="Fantasy points each NFL defense has allowed to a position",
+)
+async def points_allowed(
+    position: str = Path(description="QB, RB, WR or TE."),
+    season: int | None = Query(default=None, ge=1999, le=2100),
+    scoring_settings: dict[str, float] = Body(
+        embed=True,
+        description="A league's Sleeper scoring_settings, e.g. {\"rec\": 0.5, \"pass_td\": 4}.",
+    ),
+) -> dict[str, Any]:
+    """Every NFL team's fantasy points allowed to one position, under the
+    caller's own scoring rules. This is strength of schedule for a fantasy
+    roster: not a defense's real-world rank, but how many fantasy points it
+    has actually given up at that position - the number that should move a
+    close start/sit or trade-value call between two similar players.
+    """
+    if position.upper() not in {"QB", "RB", "WR", "TE"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{position}' is not a skill position. Use one of: QB, RB, WR, TE.",
+        )
+    target_season = season or await current_season()
+    return await nflverse.points_allowed(position, target_season, scoring_settings)
 
 
 @app.get(
@@ -321,6 +384,22 @@ async def byes_for_season(season: int = Path(ge=1999, le=2100)) -> dict[str, Any
     """
     data, meta = await schedule.season(season)
     return {"season": season, "byes": data.get("byes") or {}, "cache": meta}
+
+
+@app.get(
+    "/schedule/{season}",
+    tags=["external"],
+    dependencies=[Depends(require_api_key)],
+    summary="Every team's opponent, week by week",
+)
+async def schedule_for_season(season: int = Path(ge=1999, le=2100)) -> dict[str, Any]:
+    """team abbreviation -> {week: opponent abbreviation}, for the whole
+    regular season. Not tied to any league, so it lives here; paired with
+    `/points-allowed/{position}` this is what a per-player remaining-schedule
+    difficulty view is built from.
+    """
+    opponents = await schedule.opponents(season)
+    return {"season": season, "opponents": opponents}
 
 
 @app.get(
