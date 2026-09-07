@@ -27,11 +27,13 @@ COPY main.py entrypoint.py ./
 COPY app ./app
 
 # Non-root user, with a writable directory for the player cache and every
-# league's database.
+# league's database. Stays root at container start on purpose: entrypoint.py
+# fixes ownership of whatever gets mounted at /data (a Railway Volume mounts
+# as a separate, typically root-owned filesystem regardless of this chown)
+# and drops to appuser itself before serving anything - see entrypoint.py.
 RUN useradd --create-home --uid 10001 appuser \
     && mkdir -p /data \
     && chown -R appuser:appuser /data /app
-USER appuser
 
 # No VOLUME instruction: Railway rejects it at build time ("use Railway
 # Volumes" instead) and Docker Compose doesn't need it either - the named
