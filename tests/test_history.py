@@ -224,3 +224,47 @@ async def test_capture_without_an_odds_key_still_archives_injuries(store):
     assert result["odds"]["written"] == 0
     assert "ODDS_API_KEY" in result["odds"]["error"]
     assert result["injuries"]["written"] == 1
+
+
+# --- Auto-capture -------------------------------------------------------------
+
+
+async def test_auto_capture_writes_and_never_raises(store):
+    from app.history import auto_capture
+
+    await auto_capture(store, "odds", 2025, 2, odds_rows(_odds()))
+    assert len(store.read("odds", 2025, week=2)) == 1
+
+    # A broken store must not propagate out of a read request.
+    class Broken:
+        async def append(self, *args, **kwargs):
+            raise RuntimeError("disk on fire")
+
+    await auto_capture(Broken(), "odds", 2025, 2, odds_rows(_odds()))
+
+
+async def test_auto_capture_ignores_missing_season_or_week(store):
+    from app.history import auto_capture
+
+    await auto_capture(store, "odds", None, 2, odds_rows(_odds()))
+    await auto_capture(store, "odds", 2025, None, odds_rows(_odds()))
+    await auto_capture(store, "odds", 2025, 2, [])
+    assert store.read("odds", 2025) == []
+
+
+async def test_the_subject_index_survives_appends_without_rereading(store):
+    """The dedupe memo must stay correct as rows are appended, since it is what
+    keeps auto-capture off the archive file on every request."""
+    await store.append("odds", 2025, 2, odds_rows(_odds(spread=-9.0)))
+    # Force the memo to exist, then append through it.
+    assert store._index[("odds", 2025, 2)]
+    await store.append("odds", 2025, 2, odds_rows(_odds(spread=-9.0)))
+    await store.append("odds", 2025, 2, odds_rows(_odds(spread=-6.0)))
+
+    rows = store.read("odds", 2025, week=2)
+    assert [r["home_spread"] for r in rows] == [-9.0, -6.0]
+
+    # A fresh store reading the same file must reach the same conclusion.
+    fresh = HistoryStore(store.directory)
+    again = await fresh.append("odds", 2025, 2, odds_rows(_odds(spread=-6.0)))
+    assert again["written"] == 0

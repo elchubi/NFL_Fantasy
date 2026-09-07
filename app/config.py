@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     # Append-only archive for the sources that cannot be re-fetched later.
     # Empty means "history/ under the cache directory".
     history_dir: str = ""
+    # Archive whatever a read endpoint pulls fresh from upstream, on top of the
+    # scheduled /capture. Set false to archive only on /capture.
+    history_auto_capture: bool = True
 
     # Open-Meteo (no key).
     weather_base_url: str = "https://api.open-meteo.com/v1/forecast"

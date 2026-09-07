@@ -19,7 +19,7 @@ from app import __version__, enrichment, services
 from app.config import get_settings
 from app.espn import EspnProvider
 from app.history import SOURCES as HISTORY_SOURCES
-from app.history import HistoryStore, capture_week
+from app.history import HistoryStore, auto_capture, capture_week, injury_rows, odds_rows
 from app.http import build_client
 from app.nflverse import NflverseProvider, require_gsis
 from app.odds import OddsProvider
@@ -47,11 +47,19 @@ odds = OddsProvider(external_http)
 espn = EspnProvider(external_http)
 weather = WeatherProvider(external_http)
 
-PROVIDERS = {"nflverse": nflverse, "odds": odds, "espn": espn, "weather": weather}
-
 # Append-only archive for betting lines and injury reports - the only two
 # sources that cannot be re-fetched from upstream once the week has passed.
 history = HistoryStore(settings.history_path())
+
+# Sources that keep a disk cache (warmed at startup).
+CACHED_PROVIDERS = {"nflverse": nflverse, "odds": odds, "espn": espn, "weather": weather}
+
+# What the /snapshot blocks get. The history store rides along so those blocks
+# can archive whatever they pull fresh, the same as the read endpoints do.
+PROVIDERS = {
+    **CACHED_PROVIDERS,
+    "history": history if settings.history_auto_capture else None,
+}
 
 
 @asynccontextmanager
@@ -63,7 +71,7 @@ async def lifespan(app: FastAPI):
     # Warm the in-memory copy from disk; the network refresh happens lazily on
     # the first request so a cold Sleeper never blocks startup.
     players.load_from_disk()
-    for provider in PROVIDERS.values():
+    for provider in CACHED_PROVIDERS.values():
         provider.cache.load()
     if not settings.odds_api_key:
         log.info("ODDS_API_KEY is not set; /odds will return 503 until it is.")
@@ -288,7 +296,12 @@ async def odds_for_week(
     Cached for a day to protect the free tier's ~500 requests/month; the quota
     The Odds API reports back is included in the response.
     """
-    return await odds.for_week(week, season or await current_season())
+    target_season = season or await current_season()
+    payload = await odds.for_week(week, target_season)
+    if settings.history_auto_capture and (payload.get("cache") or {}).get("refreshed"):
+        # Fresh from upstream, so this is a line state worth keeping.
+        await auto_capture(history, "odds", target_season, week, odds_rows(payload["games"]))
+    return payload
 
 
 @app.get(
@@ -304,7 +317,9 @@ async def injury_report_by_team(
 ) -> dict[str, Any]:
     """Every listed injury for a team, with practice participation when ESPN
     includes it in the note (full / limited / did_not_practice)."""
-    return await espn.team_report(team)
+    report = await espn.team_report(team)
+    await _archive_injuries(report)
+    return report
 
 
 @app.get(
@@ -339,6 +354,7 @@ async def injury_report_by_player(
         )
 
     report = await espn.team_report(team)
+    await _archive_injuries(report)
     espn_id = players.espn_id(player_id)
     needle = " ".join(sleeper_player["name"].lower().split())
 
@@ -510,6 +526,41 @@ async def history_rows(
         "count": len(rows),
         "rows": rows,
     }
+
+
+async def _archive_injuries(report: dict[str, Any]) -> None:
+    """Archive a team injury report that was just refreshed from ESPN."""
+    if not settings.history_auto_capture:
+        return
+    if not (report.get("cache") or {}).get("refreshed"):
+        return
+    team = report.get("team")
+    injuries = report.get("injuries") or []
+    if not team or not injuries:
+        return
+    season, week = await _current_season_week()
+    await auto_capture(history, "injuries", season, week, injury_rows(team, injuries))
+
+
+# The season and week only change once a week, so one Sleeper call an hour is
+# plenty - and it keeps auto-capture from adding a round trip per request.
+_SEASON_WEEK_MEMO: dict[str, Any] = {"value": None, "at": 0.0}
+_SEASON_WEEK_TTL = 3600.0
+
+
+async def _current_season_week() -> tuple[int | None, int | None]:
+    import time as _time
+
+    if _SEASON_WEEK_MEMO["value"] and (_time.time() - _SEASON_WEEK_MEMO["at"]) < _SEASON_WEEK_TTL:
+        return _SEASON_WEEK_MEMO["value"]
+    try:
+        state = await client.nfl_state()
+        value = (int(state.get("season")), services.current_week(state))
+    except (HTTPException, TypeError, ValueError) as exc:
+        log.warning("Could not resolve the current season/week for auto-capture: %s", exc)
+        return (None, None)
+    _SEASON_WEEK_MEMO.update(value=value, at=_time.time())
+    return value
 
 
 async def current_week_number() -> int:

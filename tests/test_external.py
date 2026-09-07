@@ -259,6 +259,21 @@ def test_calm_weather_reports_no_concern():
 
 
 @pytest.mark.asyncio
+async def test_cache_reports_whether_it_went_upstream(tmp_path):
+    """Auto-capture keys off this flag: archiving a cache hit would re-scan the
+    archive only to conclude nothing changed."""
+    cache = KeyedDiskCache(tmp_path / "c.json", name="t", default_ttl_seconds=3600)
+
+    async def loader():
+        return {"v": 1}
+
+    _, first_meta = await cache.get_or_refresh("k", loader)
+    _, second_meta = await cache.get_or_refresh("k", loader)
+    assert first_meta["refreshed"] is True
+    assert second_meta["refreshed"] is False
+
+
+@pytest.mark.asyncio
 async def test_cache_refreshes_only_when_stale(tmp_path):
     cache = KeyedDiskCache(tmp_path / "c.json", name="t", default_ttl_seconds=3600)
     calls = []

@@ -117,17 +117,26 @@ class KeyedDiskCache:
         self._entries[key] = {"fetched_at": time.time(), "data": data}
         self.save()
 
-    def meta(self, key: str) -> dict[str, Any]:
+    def meta(self, key: str, *, refreshed: bool | None = None) -> dict[str, Any]:
+        """Cache state for one key.
+
+        `refreshed` says whether this particular call went to the upstream, which
+        is what auto-capture keys off: archiving a cache hit would re-scan the
+        archive to conclude nothing changed.
+        """
         entry = self.peek(key)
         if not entry:
             return {"source_cached": False, "fetched_at": None, "age_hours": None}
         fetched_at = float(entry.get("fetched_at") or 0)
-        return {
+        meta = {
             "source_cached": True,
             "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(fetched_at)),
             "age_hours": round((time.time() - fetched_at) / 3600, 2),
             "stale": self.is_stale(key),
         }
+        if refreshed is not None:
+            meta["refreshed"] = refreshed
+        return meta
 
     def _lock(self, key: str) -> asyncio.Lock:
         lock = self._locks.get(key)
@@ -149,12 +158,12 @@ class KeyedDiskCache:
         rather than failing the request.
         """
         if not self.is_stale(key, ttl):
-            return self.peek(key)["data"], self.meta(key)
+            return self.peek(key)["data"], self.meta(key, refreshed=False)
 
         async with self._lock(key):
             # Another request may have refreshed while we waited for the lock.
             if not self.is_stale(key, ttl):
-                return self.peek(key)["data"], self.meta(key)
+                return self.peek(key)["data"], self.meta(key, refreshed=False)
 
             log.info("[%s] refreshing '%s'...", self.name, key)
             try:
@@ -168,13 +177,13 @@ class KeyedDiskCache:
                         key,
                         exc,
                     )
-                    meta = self.meta(key)
+                    meta = self.meta(key, refreshed=False)
                     meta["refresh_failed"] = str(getattr(exc, "detail", exc))
                     return stale["data"], meta
                 raise
 
             self.put(key, data)
-            return data, self.meta(key)
+            return data, self.meta(key, refreshed=True)
 
     def status(self) -> dict[str, Any]:
         self.load()

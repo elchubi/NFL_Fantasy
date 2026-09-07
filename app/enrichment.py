@@ -15,6 +15,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from app.history import auto_capture, injury_rows, odds_rows
 from app.players import PlayerStore
 from app.teams import normalise_abbr
 
@@ -95,11 +96,21 @@ async def build_blocks(
             advanced_stats_block(providers["nflverse"], players, roster_players, season),
         )
     if "odds" in includes:
-        tasks["odds"] = _guarded("odds", odds_block(providers["odds"], week, season))
+        tasks["odds"] = _guarded(
+            "odds", odds_block(providers["odds"], week, season, providers.get("history"))
+        )
     if "injury_report" in includes:
         tasks["injury_report"] = _guarded(
             "injury_report",
-            injury_block(providers["espn"], players, roster_players, nfl_teams),
+            injury_block(
+                providers["espn"],
+                players,
+                roster_players,
+                nfl_teams,
+                season,
+                week,
+                providers.get("history"),
+            ),
         )
     if "weather" in includes:
         tasks["weather"] = _guarded(
@@ -159,13 +170,17 @@ async def advanced_stats_block(
     }
 
 
-async def odds_block(odds: Any, week: int, season: int | None) -> dict[str, Any]:
+async def odds_block(
+    odds: Any, week: int, season: int | None, history: Any = None
+) -> dict[str, Any]:
     if not odds.configured:
         return {
             "available": False,
             "error": "ODDS_API_KEY is not configured; set it to enable betting lines.",
         }
     payload = await odds.for_week(week, season)
+    if history is not None and (payload.get("cache") or {}).get("refreshed"):
+        await auto_capture(history, "odds", season, week, odds_rows(payload["games"]))
     return {"available": True, **payload}
 
 
@@ -174,6 +189,9 @@ async def injury_block(
     players: PlayerStore,
     roster_players: list[dict[str, Any]],
     nfl_teams: list[str],
+    season: int | None = None,
+    week: int | None = None,
+    history: Any = None,
 ) -> dict[str, Any]:
     """ESPN injury reports for the teams that rostered players play for."""
     reports = await asyncio.gather(
@@ -183,12 +201,15 @@ async def injury_block(
     by_espn_id: dict[str, dict[str, Any]] = {}
     by_name: dict[str, dict[str, Any]] = {}
     failures: list[str] = []
+    fresh: list[dict[str, Any]] = []
     succeeded = 0
     for team, report in zip(nfl_teams, reports):
         if isinstance(report, BaseException):
             failures.append(f"{team}: {getattr(report, 'detail', report)}")
             continue
         succeeded += 1
+        if history is not None and (report.get("cache") or {}).get("refreshed"):
+            fresh.extend(injury_rows(team, report.get("injuries") or []))
         for item in report.get("injuries", []):
             if item.get("espn_id"):
                 by_espn_id[str(item["espn_id"])] = {**item, "nfl_team": team}
@@ -214,6 +235,9 @@ async def injury_block(
             "updated": item.get("updated"),
             "comment": item.get("comment"),
         }
+
+    if fresh:
+        await auto_capture(history, "injuries", season, week, fresh)
 
     if nfl_teams and not succeeded:
         # Every team failed; saying "available" here would hide the outage.

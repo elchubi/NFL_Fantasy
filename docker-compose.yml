@@ -23,6 +23,7 @@ services:
       WEATHER_CACHE_TTL_HOURS: ${WEATHER_CACHE_TTL_HOURS:-12}
       # Append-only archive of odds and injury reports (see /capture).
       HISTORY_DIR: /data/history
+      HISTORY_AUTO_CAPTURE: ${HISTORY_AUTO_CAPTURE:-true}
       HTTP_TIMEOUT: ${HTTP_TIMEOUT:-20}
       PLAYERS_HTTP_TIMEOUT: ${PLAYERS_HTTP_TIMEOUT:-120}
       CORS_ORIGINS: ${CORS_ORIGINS:-*}

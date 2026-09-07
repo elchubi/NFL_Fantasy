@@ -52,6 +52,12 @@ class HistoryStore:
     def __init__(self, directory: str | Path) -> None:
         self.directory = Path(directory)
         self._lock = asyncio.Lock()
+        # Last recorded state per subject, per (source, season, week). Built
+        # from the file the first time a week is touched and updated on every
+        # append, so a capture does not re-read the whole season to work out
+        # what changed. With more than one worker process the memos can drift,
+        # which at worst writes a duplicate row - the app runs single-worker.
+        self._index: dict[tuple[str, int, int], dict[tuple, dict[str, Any]]] = {}
 
     def path_for(self, source: str, season: int) -> Path:
         return self.directory / f"{source}_{season}.jsonl"
@@ -92,9 +98,15 @@ class HistoryStore:
 
     def _latest_by_subject(self, source: str, season: int, week: int) -> dict[tuple, dict[str, Any]]:
         """The most recent row recorded for each subject in this week."""
+        memo_key = (source, season, week)
+        cached = self._index.get(memo_key)
+        if cached is not None:
+            return cached
+
         latest: dict[tuple, dict[str, Any]] = {}
         for row in self.read(source, season, week=week):
             latest[self._subject_key(source, row)] = row
+        self._index[memo_key] = latest
         return latest
 
     @staticmethod
@@ -162,6 +174,9 @@ class HistoryStore:
             except OSError as exc:
                 log.warning("Could not append history to %s: %s", path, exc)
                 return {"source": source, "written": 0, "error": str(exc)}
+
+            for row in new_rows:
+                latest[self._subject_key(source, row)] = row
 
             return {
                 "source": source,
@@ -354,3 +369,38 @@ async def _capture_injuries(
     if failures:
         result["teams_failed"] = failures
     return result
+
+
+# --- Opportunistic capture ----------------------------------------------------
+
+
+async def auto_capture(
+    store: HistoryStore,
+    source: str,
+    season: int | None,
+    week: int | None,
+    rows: list[dict[str, Any]],
+) -> None:
+    """Archive rows that a read endpoint just pulled from upstream.
+
+    Best-effort by design: this runs on the path of an ordinary read request,
+    so a broken archive must never turn a working `/odds` call into a 500. Any
+    failure is logged and swallowed.
+
+    Only call this when the data actually came from upstream. Archiving a cache
+    hit would re-scan the archive just to conclude nothing changed.
+    """
+    if not rows or season is None or week is None:
+        return
+    try:
+        result = await store.append(source, season, week, rows)
+        if result.get("written"):
+            log.info(
+                "Auto-captured %s row(s) of %s for %s week %s.",
+                result["written"],
+                source,
+                season,
+                week,
+            )
+    except Exception as exc:  # noqa: BLE001 - never fail the read it rode in on
+        log.warning("Auto-capture of %s failed: %s", source, exc)

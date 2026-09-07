@@ -300,21 +300,47 @@ So this service archives **only the two that evaporate**. Re-storing the other t
 would duplicate public archives that are better maintained than anything kept here, and
 leave a schema to migrate for years.
 
-### `POST /capture`
+Capture happens two ways, and they cover each other's gaps.
+
+### 1. Automatically, on every read
+
+Whenever `/odds`, `/injury-report` or a `/snapshot?include=odds,injury_report` pulls
+data **fresh from upstream**, that data is also archived. Nothing to schedule, and
+anything you look at is recorded by the act of looking at it.
+
+It fires only on an actual upstream fetch, never on a cache hit — archiving a cached
+response would re-scan the archive just to conclude nothing changed. It is also
+strictly best-effort: a failure is logged and swallowed, because a broken archive must
+never turn a working `/odds` call into a `500`.
+
+The gap this leaves is coverage: a week nobody asks about is a week nobody records.
+Hence the second path.
+
+Set `HISTORY_AUTO_CAPTURE=false` to turn this off and archive only on `/capture`.
+
+### 2. On a schedule, via `POST /capture`
 
 Writes the current week's betting lines and injury reports to an append-only
 [JSON Lines](https://jsonlines.org) file, one per source per season, under
 `HISTORY_DIR`. Query params: `week`, `season` (both default to current), `teams`
 (defaults to all 32) and `refresh` (default `true`).
 
+Unlike the automatic path this captures **all 32 teams and every game**, whether or not
+anyone asked about them, which is what makes the archive complete rather than a record
+of your browsing.
+
 `refresh=true` bypasses the read caches so the archived line is the one live at capture
 time, rather than whatever a browsing request happened to warm the cache with hours
 earlier. That is the entire point of capturing on a schedule, so it defaults on and
 costs one Odds API call per capture.
 
-**A capture that would write a row identical to the last recorded state is skipped.** So
-running the cron more often than the lines move costs nothing, but every real change is
-kept:
+### Both together
+
+The two paths share one deduplicated archive, so they never double-write. **A capture
+that would write a row identical to the last recorded state is skipped**, whichever path
+it came from. If browsing already recorded Thursday's line, the Thursday cron writes
+nothing; if nobody browsed, the cron is the only record. Running either more often than
+the lines move costs nothing, and every real change is kept:
 
 ```
 08:33:23  DET@KC  spread=-9.0  total=50.0     <- Thursday
@@ -337,7 +363,8 @@ curl -fsS -X POST -H "X-API-Key: $API_KEY" https://your-domain.example/capture
 ```
 
 Twice a week for 18 weeks is ~36 Odds API calls a season, against a ~500/month free
-allowance. Storage runs roughly **250KB of odds and ~2MB of injuries per season** — the
+allowance. The automatic path adds no calls of its own — it only archives fetches that
+were going to happen anyway. Storage runs roughly **250KB of odds and ~2MB of injuries per season** — the
 same `/data` volume covers it without going near needing a database engine.
 
 ### Reading it back
@@ -354,6 +381,12 @@ team is favoured by 7+?*, *do players listed limited on Wednesday actually play?
 An interrupted write can leave a torn final line. The reader skips it with a warning
 instead of failing, and the next append starts on a fresh line so the damage stays
 confined to that one row.
+
+Deduplication is decided against an in-memory index of the last state per subject, built
+from the file the first time a week is touched, so auto-capture does not re-read the
+season archive on every request. The app runs single-worker (`--workers 1`); with
+several worker processes those indexes could drift and occasionally write a duplicate
+row, which is harmless but worth knowing before raising the worker count.
 
 ## Authentication
 
@@ -388,6 +421,7 @@ required).
 | `WEATHER_CACHE_TTL_HOURS` | no | `12` | Forecast cache during the week |
 | `WEATHER_GAMEDAY_CACHE_TTL_HOURS` | no | `1` | Forecast cache once kickoff is within a day |
 | `HISTORY_DIR` | no | `<CACHE_DIR>/history` | Append-only archive of odds and injury reports |
+| `HISTORY_AUTO_CAPTURE` | no | `true` | Also archive what read endpoints pull fresh, not just `/capture` |
 | `SLEEPER_BASE_URL` | no | `https://api.sleeper.app/v1` | Sleeper API base URL |
 | `HTTP_TIMEOUT` | no | `20` | Per-request timeout (seconds) for Sleeper calls |
 | `PLAYERS_HTTP_TIMEOUT` | no | `120` | Timeout for the ~5MB player file download |
@@ -448,7 +482,9 @@ pytest -q
 4. **Port** — the container listens on `8000`; Coolify's proxy maps it to your domain.
 5. **Healthcheck** — `GET /health` (unauthenticated, no upstream calls). Already wired
    into both the Dockerfile and the compose file.
-6. **Scheduled task** (optional, for the archive) — add a Coolify scheduled task running
+6. **Scheduled task** (recommended, for complete archive coverage) — reads already
+   archive themselves; the cron is what covers weeks nobody browsed. Add a Coolify
+   scheduled task running
    `curl -fsS -X POST -H "X-API-Key: $API_KEY" http://localhost:8000/capture`, e.g.
    Thursdays and Sundays. See [Keeping history](#keeping-history).
 7. **Domain + HTTPS** — set your FQDN in Coolify and let it issue the certificate.
