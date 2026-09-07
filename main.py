@@ -253,6 +253,14 @@ async def roster(
 
 _SKILL_POSITIONS = ("QB", "RB", "WR", "TE")
 
+# Sleeper's own vocabulary for "still a rosterable NFL player right now".
+# Retired and long-unsigned players sit in the player file forever with no
+# status at all (or "Inactive"), rather than being removed - excluding those
+# is what keeps /available from recommending someone who last played years ago.
+_ROSTERABLE_STATUSES = frozenset(
+    {"Active", "Injured Reserve", "PUP", "Non Football Injury", "Suspended", "Practice Squad"}
+)
+
 
 @app.get(
     "/leagues/{league}/available",
@@ -316,6 +324,13 @@ async def available_players(
             if sleeper_id is None or sleeper_id in rostered:
                 continue
             resolved = players.resolve(sleeper_id)
+            # Sleeper's player file keeps long-retired and unsigned players
+            # indefinitely with no current status - nflverse still carries
+            # their old stat lines under the same gsis_id from whichever
+            # season it fell back to, so without this check a real "waiver
+            # pickup" list could recommend someone who last played years ago.
+            if resolved.get("status") not in _ROSTERABLE_STATUSES:
+                continue
             candidates.append(
                 {
                     "player_id": sleeper_id,

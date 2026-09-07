@@ -25,6 +25,10 @@ HEADERS = {"X-API-Key": "test-key"}
 FREE_AGENT_ID = "7777"
 FREE_AGENT_GSIS = "00-0099999"
 ROSTERED_RB_GSIS = "00-0011111"
+# A long-retired player nflverse still has an old stat line for under this
+# gsis_id, and who nobody has rostered either - but is not a real pickup.
+RETIRED_ID = "8899"
+RETIRED_GSIS = "00-0088888"
 
 
 @pytest.fixture
@@ -48,6 +52,13 @@ def client(monkeypatch, tmp_path):
     )
     # 4034 (Christian McCaffrey) is on roster 1 in fixtures.ROSTERS.
     main.players._players["4034"]["gsis_id"] = ROSTERED_RB_GSIS
+    main.players._players[RETIRED_ID] = _slim(
+        RETIRED_ID,
+        {
+            "first_name": "Long", "last_name": "Retired", "position": "RB",
+            "team": "IND", "status": None, "gsis_id": RETIRED_GSIS,
+        },
+    )
     main.players._reindex()
     main.players._fetched_at = time.time()
 
@@ -77,6 +88,14 @@ def client(monkeypatch, tmp_path):
                         "season_total_points": 60.0, "season_average_points": 20.0,
                         "recent_average_points": 20.0,
                     },
+                    {
+                        # Better numbers than the real free agent above - if
+                        # this shows up first, the status filter isn't working.
+                        "gsis_id": RETIRED_GSIS, "name": "Long Retired", "team": "IND",
+                        "games": 3, "weekly_points": {"1": 30.0, "2": 30.0, "3": 30.0},
+                        "season_total_points": 90.0, "season_average_points": 30.0,
+                        "recent_average_points": 30.0,
+                    },
                 ],
             }
         return {"season": 2025, "position": path.rsplit("/", 1)[-1], "scoring_not_applied": [], "players": []}
@@ -96,6 +115,16 @@ def test_a_rostered_player_never_appears_as_available(client):
     ids = [p["player_id"] for p in body["available"]["RB"]]
     assert FREE_AGENT_ID in ids
     assert "4034" not in ids  # rostered on team 1 in fixtures.ROSTERS
+
+
+def test_a_player_with_no_active_status_is_excluded_even_unrostered(client):
+    """nflverse keeps an old stat line under a retired player's gsis_id, and
+    nobody has rostered them either - but they are not a real waiver pickup,
+    so no status at all (Sleeper's own signal for "not on an NFL roster")
+    must keep them out regardless of how good their numbers look."""
+    response = client.get("/leagues/main/available?position=RB", headers=HEADERS)
+    ids = [p["player_id"] for p in response.json()["available"]["RB"]]
+    assert RETIRED_ID not in ids
 
 
 def test_unsupported_scoring_keys_are_reported_not_hidden(client):
