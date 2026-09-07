@@ -1,7 +1,8 @@
 services:
   sleeper-api:
     build: .
-    # Coolify can also pull a prebuilt image instead of building:
+    # Local development only - Railway ignores this file and builds the Dockerfile.
+    # A prebuilt image can be used instead of building:
     # image: ghcr.io/<your-user>/sleeper-fantasy-api:latest
     container_name: sleeper-fantasy-api
     restart: unless-stopped
@@ -26,6 +27,7 @@ services:
       HISTORY_AUTO_CAPTURE: ${HISTORY_AUTO_CAPTURE:-true}
       HTTP_TIMEOUT: ${HTTP_TIMEOUT:-20}
       PLAYERS_HTTP_TIMEOUT: ${PLAYERS_HTTP_TIMEOUT:-120}
+      PORT: ${PORT:-8000}
       CORS_ORIGINS: ${CORS_ORIGINS:-*}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     ports:

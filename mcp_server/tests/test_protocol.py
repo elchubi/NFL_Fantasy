@@ -185,7 +185,7 @@ def test_a_successful_call_returns_the_backend_payload(app):
 
 
 def test_the_health_route_is_outside_the_token_path(app):
-    """Coolify probes this without knowing the secret segment."""
+    """The platform probes this without knowing the secret segment."""
     with TestClient(app) as client:
         response = client.get("/healthz")
         assert response.status_code == 200

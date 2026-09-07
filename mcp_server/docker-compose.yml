@@ -4,8 +4,8 @@ services:
     container_name: sleeper-fantasy-mcp
     restart: unless-stopped
     environment:
-      # Where the REST backend lives. Inside a shared Coolify network this is
-      # the backend's service name; otherwise its public URL.
+      # Where the REST backend lives. Locally this is the backend container or
+      # host; on Railway it is the backend's private domain.
       BACKEND_URL: ${BACKEND_URL:?set BACKEND_URL in your .env}
       # The backend's API key. It stays on this side - the Claude client never
       # sees it.
@@ -16,6 +16,7 @@ services:
       # this, DNS rebinding protection is switched off.
       MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-}
       BACKEND_TIMEOUT: ${BACKEND_TIMEOUT:-60}
+      PORT: ${PORT:-8080}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     ports:
       - "${PORT:-8080}:8080"

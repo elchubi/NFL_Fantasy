@@ -50,7 +50,7 @@ a secret: anyone holding it has full access to the connector.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `BACKEND_URL` | **yes** | `http://localhost:8000` | Where the REST backend lives. Inside a shared Coolify network use the service name. |
+| `BACKEND_URL` | **yes** | `http://localhost:8000` | Where the REST backend lives. On Railway use the backend's private domain. |
 | `BACKEND_API_KEY` | **yes** | — | The backend's `API_KEY`. Stays server-side; the Claude client never sees it. |
 | `MCP_URL_TOKEN` | **yes in production** | — | The secret path segment. Without it the server sits at `/mcp` and logs a warning. |
 | `MCP_ALLOWED_HOSTS` | strongly recommended | — | Comma-separated public hostnames. See below. |
@@ -76,24 +76,49 @@ proxies pass the port through. Left empty, protection is switched off and a warn
 logged at startup — the container still works, and the URL token is what actually guards
 it, but listing the host costs nothing.
 
-## Deploying on Coolify
+## Deploying on Railway
 
-1. **New Resource → Application → Docker Compose**, pointed at this repo with
-   `mcp_server/` as the base directory.
-2. **Environment variables** — `BACKEND_URL`, `BACKEND_API_KEY`, `MCP_URL_TOKEN`,
-   `MCP_ALLOWED_HOSTS`.
-3. **Domain** — give it its own subdomain, separate from the REST backend
-   (`mcp.tudominio.com`). Let Coolify issue the certificate; Claude.ai requires HTTPS.
-4. **Networking** — if the backend runs in the same Coolify project, set `BACKEND_URL`
-   to its internal service name (`http://sleeper-fantasy-api:8000`) so the traffic never
-   leaves the host. Otherwise use its public URL, which means the backend needs to stay
-   publicly reachable too.
-5. **Healthcheck** — `GET /healthz`. It sits outside the token path on purpose, so
-   Coolify can probe it without holding the secret. It reports the MCP server's own
-   liveness, the backend URL it is pointed at, and whether the API key is configured —
-   but it does **not** call the backend, so it stays green if the backend is down. Use
-   the `health_check` tool for that.
-6. **Port** — the container listens on `8080`.
+This is the **second of two services** in one Railway project — the REST backend is the
+other. Railway builds one service per deployment, so they do not deploy together as a
+unit; they share the repo and are wired to each other through Railway's private network.
+
+1. In the project that already holds the backend, **New → GitHub Repo**, pick the same
+   repo again.
+2. **Settings → Source → Root Directory**: `/mcp_server`
+3. **Settings → Source → Watch Paths**: `/mcp_server/**`, so a backend-only commit does
+   not rebuild this service.
+4. **Variables**:
+   - `BACKEND_URL` = `http://${{backend.RAILWAY_PRIVATE_DOMAIN}}:${{backend.PORT}}`,
+     with your backend service's actual name. Private traffic never leaves Railway, and
+     the backend then needs no public domain at all.
+   - `BACKEND_API_KEY` = `${{backend.API_KEY}}` — a reference variable, so rotating the
+     key on the backend updates this automatically.
+   - `MCP_URL_TOKEN` — the secret path segment.
+   - `MCP_ALLOWED_HOSTS` — your public MCP hostname.
+5. **Networking → Generate Domain**, then set a custom one if you want. This service
+   *must* be publicly reachable: Claude connects from Anthropic's infrastructure, not
+   from your machine.
+6. **Healthcheck** — `railway.json` already sets `/healthz`. It sits outside the token
+   path so the platform can probe it without holding the secret, and it deliberately does
+   **not** call the backend, so it stays green if the backend is down. The `health_check`
+   tool is what proves the two services can actually talk.
+
+`docker-compose.yml` is ignored by Railway; it stays for local development.
+
+### Two Railway specifics worth knowing
+
+**Railway assigns the port.** It injects `PORT` and expects the process to bind it. A
+hardcoded port builds and starts cleanly and then fails its healthcheck forever, which is
+a confusing way to lose an afternoon. `entrypoint.py` reads `PORT`.
+
+**Private networking is IPv6-only.** A process bound to `0.0.0.0` cannot be reached at
+`<service>.railway.internal`; the caller just times out with nothing in either log.
+`entrypoint.py` binds `::`, which also accepts IPv4 on a dual-stack host, and falls back
+to `0.0.0.0` where there is no IPv6 stack, so the same image runs locally too. Set `HOST`
+to override.
+
+If you would rather not use private networking, point `BACKEND_URL` at the backend's
+public URL instead — it works, it just sends the traffic out and back.
 
 ## The tools
 
@@ -171,7 +196,7 @@ model needs to fix its own call.
 
 This version has **no authentication of its own**. The URL token is the only thing
 standing between the internet and your league data, and it travels in the URL — in
-Claude.ai's connector settings, in your `.env`, in Coolify's environment. That is an
+Claude.ai's connector settings, in your `.env`, in Railway's variables. That is an
 acceptable trade for a single-user server and nothing more.
 
 Concretely: anyone with the URL can read your league and write to your decision log.
@@ -201,6 +226,8 @@ propagation, the token path, and the Host header check.
 ```
 server.py            The MCP server: 21 tools, annotations, transport wiring
 backend.py           HTTP client for the REST backend; holds BACKEND_API_KEY
+entrypoint.py        Binds the platform's PORT, and IPv6 for private networking
+railway.json         Railway build and healthcheck config
 Dockerfile           Multi-stage build, non-root, healthcheck
 docker-compose.yml   Example deployment
 tests/               Offline tests, including protocol-level ones

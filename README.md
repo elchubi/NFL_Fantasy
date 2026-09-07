@@ -22,7 +22,7 @@ Base URL is wherever you deployed it. Every endpoint except `/health` requires
 
 | Method | Endpoint | Params | What it does |
 | --- | --- | --- | --- |
-| `GET` | `/health` | — | Liveness probe for Coolify. No auth, no upstream calls; reports cache state. |
+| `GET` | `/health` | — | Liveness probe for the platform. No auth, no upstream calls; reports cache state. |
 | `GET` | `/snapshot` | `week`, `days=7`, `include` | The whole league: teams, rosters (starters by slot / bench / IR), standings, matchups and transactions, with player IDs resolved to names. `include=advanced_stats,odds,injury_report,weather` attaches the external sources. |
 | `GET` | `/league-settings` | — | League configuration in plain language: scoring, roster slots, playoff format, trade deadline, waiver rules. |
 | `GET` | `/roster/{manager}` | `manager` | One resolved roster. Flexible lookup by username, display name or team name (exact → prefix → substring). `404` lists the teams, `409` the candidates when ambiguous. |
@@ -574,15 +574,17 @@ actually changed.
 
 ### Scheduling it
 
-Point a scheduler at the endpoint — Coolify's scheduled tasks, or any cron:
+Point a scheduler at the endpoint — a Railway cron service, or any cron:
 
 ```bash
 # Thursday evening and Sunday shortly before the early kickoffs
 curl -fsS -X POST -H "X-API-Key: $API_KEY" https://your-domain.example/capture
 ```
 
-Twice a week for 18 weeks is ~36 Odds API calls a season, against a ~500/month free
-allowance. The automatic path adds no calls of its own — it only archives fetches that
+On Railway, add a third service in the same project with **Settings → Cron Schedule**
+(e.g. `0 23 * * 4` and a second for Sunday), running that curl against the backend's
+private domain. Twice a week for 18 weeks is ~36 Odds API calls a season, against a
+~500/month free allowance. The automatic path adds no calls of its own — it only archives fetches that
 were going to happen anyway. Storage runs roughly **250KB of odds and ~2MB of injuries per season** — the
 same `/data` volume covers it without going near needing a database engine.
 
@@ -683,39 +685,83 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-## Deploying on Coolify
+## Deploying on Railway
 
-1. **New Resource → Application → Docker Compose** (or *Dockerfile* if you prefer;
-   both are in the repo) and point it at this Git repository, branch of your choice.
-2. **Environment variables** — add at minimum:
-   - `LEAGUE_ID` = your Sleeper league id
-   - `API_KEY` = a long random string (`openssl rand -hex 32`)
+**The two services do not deploy as one unit.** Railway builds one service per
+deployment, so this repo backs **two services in a single project**, each pointed at a
+different root directory:
+
+| Service | Root Directory | Domain | Healthcheck |
+| --- | --- | --- | --- |
+| the REST backend | `/` | `api.tudominio.com` | `/health` |
+| the MCP server | `/mcp_server` | `mcp.tudominio.com` | `/healthz` |
+
+They build and redeploy independently. `docker-compose.yml` is **ignored by Railway** —
+it stays for local development. Each root has a `railway.json` that pins the Dockerfile
+builder and the healthcheck path.
+
+### 1. The backend service
+
+1. **New Project → Deploy from GitHub repo**, pick this repo.
+2. **Settings → Source → Root Directory**: `/`
+3. **Settings → Source → Watch Paths**: `/app/**`, `/main.py`, `/Dockerfile`,
+   `/requirements.txt` — otherwise every commit to `mcp_server/` rebuilds this too.
+4. **Variables**:
+   - `LEAGUE_ID` — your Sleeper league id
+   - `API_KEY` — `openssl rand -hex 32`
    - `PLAYERS_CACHE_PATH` = `/data/players_cache.json`
    - `CACHE_DIR` = `/data`
-   - `ODDS_API_KEY` = your free key from the-odds-api.com (optional; skip it and
-     `/odds` returns `503` while every other endpoint works)
-3. **Persistent storage** — add a volume mounted at `/data`. Without it the ~5MB player
-   file is re-downloaded from Sleeper after every restart, and the nflverse aggregate is
-   rebuilt from ~120MB of source files. The compose file already declares the
-   `players-cache` volume if you deploy that way.
-4. **Port** — the container listens on `8000`; Coolify's proxy maps it to your domain.
-5. **Healthcheck** — `GET /health` (unauthenticated, no upstream calls). Already wired
-   into both the Dockerfile and the compose file.
-6. **Scheduled task** (recommended, for complete archive coverage) — reads already
-   archive themselves; the cron is what covers weeks nobody browsed. Add a Coolify
-   scheduled task running
-   `curl -fsS -X POST -H "X-API-Key: $API_KEY" http://localhost:8000/capture`, e.g.
-   Thursdays and Sundays. See [Keeping history](#keeping-history).
-7. **Domain + HTTPS** — set your FQDN in Coolify and let it issue the certificate.
-8. Deploy, then verify:
-   ```bash
-   curl https://your-domain.example/health
-   curl -H "X-API-Key: <your key>" https://your-domain.example/league-settings
-   curl -H "X-API-Key: <your key>" https://your-domain.example/injury-report?team=KC
-   ```
+   - `HISTORY_DIR` = `/data/history`
+   - `ODDS_API_KEY` — optional
+5. **Volume**: attach one mounted at `/data`. Without it the ~5MB player file and the
+   ~5MB nflverse aggregate are rebuilt on every deploy, and the append-only archive is
+   **lost entirely** — that one cannot be re-fetched.
+6. **Networking**: generate a domain, or a public one only if you want to call the API
+   directly. The MCP server can reach it privately without one.
 
-To reuse the project for a different league later, change `LEAGUE_ID` and redeploy —
-nothing about the league is hardcoded.
+### 2. The MCP service
+
+1. In the **same project**, **New → GitHub Repo**, pick the same repo again.
+2. **Settings → Source → Root Directory**: `/mcp_server`
+3. **Watch Paths**: `/mcp_server/**`
+4. **Variables**:
+   - `BACKEND_URL` = `http://${{backend.RAILWAY_PRIVATE_DOMAIN}}:${{backend.PORT}}`
+     (substitute your backend service's name), or its public URL
+   - `BACKEND_API_KEY` = `${{backend.API_KEY}}` — a reference variable, so rotating the
+     key on the backend updates both
+   - `MCP_URL_TOKEN` — `python -c "import secrets; print(secrets.token_urlsafe(32))"`
+   - `MCP_ALLOWED_HOSTS` = your MCP domain
+5. **Networking**: generate a public domain. Claude.ai connects from Anthropic's
+   infrastructure, so this one has to be publicly reachable.
+
+### Two things Railway does differently
+
+**It assigns the port.** Railway injects `PORT` and expects the process to bind it; a
+hardcoded port builds and starts fine and then fails its healthcheck forever. Both
+services start through `entrypoint.py`, which reads `PORT`.
+
+**Private networking is IPv6-only.** A process bound to `0.0.0.0` is unreachable at
+`<service>.railway.internal` — the caller just times out with nothing in either log.
+`entrypoint.py` binds `::`, which covers IPv4 too on a dual-stack host, and falls back to
+`0.0.0.0` where there is no IPv6 stack (some local Docker setups), so the same image runs
+in both places. `HOST` overrides the detection if you need it to.
+
+### Verifying
+
+```bash
+curl https://api.tudominio.com/health
+curl https://mcp.tudominio.com/healthz
+```
+
+The MCP server's `/healthz` reports the backend URL it is pointed at and whether the key
+is configured, but deliberately does **not** call the backend, so it stays green if the
+backend is down. Use the `health_check` tool for that — it is the one that proves the two
+services can actually talk.
+
+### Running it locally
+
+`docker compose up --build` still works for both (see each `docker-compose.yml`); Railway
+just does not use those files.
 
 ## What was and wasn't verified
 

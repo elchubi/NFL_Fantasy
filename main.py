@@ -130,7 +130,7 @@ def league_id() -> str:
     return settings.league_id
 
 
-@app.get("/health", tags=["ops"], summary="Healthcheck for Coolify")
+@app.get("/health", tags=["ops"], summary="Healthcheck for the platform")
 async def health() -> dict[str, Any]:
     return {
         "status": "ok",
@@ -827,7 +827,7 @@ async def capture(
 ) -> dict[str, Any]:
     """Write this week's odds and injury reports to the append-only archive.
 
-    Meant to be called from a scheduler (Coolify cron), typically once on
+    Meant to be called from a scheduler (a Railway cron service), typically once on
     Thursday and once shortly before Sunday kickoff. Rows identical to the last
     recorded state are skipped, so calling it more often than the lines move
     costs nothing but still captures every real change.

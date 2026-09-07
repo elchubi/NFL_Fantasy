@@ -13,14 +13,15 @@ RUN pip install --no-cache-dir --upgrade pip \
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
+    DEFAULT_PORT=8080 \
+    APP_MODULE=server:app \
     PYTHONDONTWRITEBYTECODE=1 \
-    PATH="/opt/venv/bin:$PATH" \
-    PORT=8080
+    PATH="/opt/venv/bin:$PATH"
 
 COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
-COPY server.py backend.py ./
+COPY server.py backend.py entrypoint.py ./
 
 RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /app
 USER appuser
@@ -29,6 +30,6 @@ EXPOSE 8080
 
 # The MCP server's own liveness, separate from the backend's /health.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=4).status == 200 else 1)"
+    CMD python -c "import os,urllib.request,sys; p=os.getenv('PORT','8080'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}/healthz', timeout=4).status == 200 else 1)"
 
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+CMD ["python", "entrypoint.py"]
