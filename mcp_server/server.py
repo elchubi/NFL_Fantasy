@@ -524,6 +524,38 @@ async def manager_trade_fits(manager: str, league: str | None = None) -> Any:
 
 
 @mcp.tool(
+    name="manager_faab_bid",
+    annotations=READ_ONLY,
+    description=(
+        "A FAAB bid recommendation anchored to this league's own bidding "
+        "history and budgets, not a generic dollar rule: finds the rival with "
+        "both a track record of bidding high and enough remaining budget to do "
+        "it again, and recommends a bid that beats them with a margin that "
+        "scales with confidence. Use it right before placing a waiver bid."
+    ),
+)
+async def manager_faab_bid(
+    manager: str,
+    league: str | None = None,
+    player_id: str | None = None,
+    confidence: Literal["low", "medium", "high"] = "medium",
+) -> Any:
+    """
+    Args:
+        manager: Your own team - username, display name or team name.
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
+        player_id: Sleeper player id, only used to label the response.
+        confidence: How much you want this player - low, medium or high.
+    """
+    lid = _resolve_league(league)
+    return await _get(
+        f"/leagues/{lid}/faab-bid/{manager}",
+        params={"player_id": player_id, "confidence": confidence},
+    )
+
+
+@mcp.tool(
     name="decision_log",
     annotations=APPEND_ONLY,
     description=(
@@ -860,7 +892,7 @@ TOOL_NAMES = [
     "stats_advanced", "stats_odds", "stats_injury_report_team",
     "stats_injury_report_player", "stats_weather", "stats_stadiums",
     "manager_list", "manager_profile", "manager_pressure", "manager_playoff_odds",
-    "manager_trade_fits",
+    "manager_trade_fits", "manager_faab_bid",
     "decision_log", "decision_log_outcome", "decision_list",
     "draft_class", "draft_prospect",
     "history_backfill", "history_seasons",

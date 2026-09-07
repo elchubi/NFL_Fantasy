@@ -69,7 +69,7 @@ def test_every_tool_is_listed_with_a_description(app):
 
     names = {t["name"] for t in tools}
     assert names == set(server.TOOL_NAMES)
-    assert len(names) == 28
+    assert len(names) == 29
     for tool in tools:
         # The description is what the model reads to decide whether to call it,
         # so an empty or stub one is a real defect.
@@ -243,7 +243,7 @@ def test_the_health_route_is_outside_the_token_path(app):
         assert response.status_code == 200
         body = response.json()
         assert body["status"] == "ok"
-        assert body["tools"] == 28
+        assert body["tools"] == 29
         assert body["backend_api_key_configured"] is True
 
 

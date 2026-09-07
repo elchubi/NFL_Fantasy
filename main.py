@@ -1016,6 +1016,103 @@ async def trade_fits(
     }
 
 
+@app.get(
+    "/leagues/{league}/faab-bid/{manager}",
+    tags=["edge"],
+    dependencies=[Depends(require_api_key)],
+    summary="A FAAB bid recommendation, based on this league's own history",
+)
+async def faab_bid(
+    league: str = Path(description="A slug from GET /leagues."),
+    manager: str = Path(description="Your own team - username, display name or team name."),
+    player_id: str | None = Query(
+        default=None, description="Sleeper player id, for a labelled response."
+    ),
+    confidence: str = Query(
+        default="medium",
+        description="low, medium or high - how much you want this player.",
+    ),
+) -> dict[str, Any]:
+    """Recommends a bid against this league's own remaining budgets and
+    bidding history, not a generic 'bid $X for a WR2' rule.
+
+    Takes the most dangerous rival - the manager with both a track record of
+    bidding high and enough remaining budget to actually do it again - as the
+    baseline, then adds a margin that scales with how much you want the
+    player. There is no signal here about who else actually wants this
+    specific player; it answers "what would it take to beat the worst
+    plausible competitor", not "will anyone else even bid".
+    """
+    if confidence not in ("low", "medium", "high"):
+        raise HTTPException(
+            status_code=400, detail="confidence must be one of: low, medium, high."
+        )
+    await players.ensure_fresh()
+    lid = settings.league_id_for(league)
+    fetched, users, rosters = await asyncio.gather(
+        client.league(lid), client.users(lid), client.rosters(lid)
+    )
+    teams = services.build_teams(users, rosters)
+    match = _match_team_or_404(teams, manager)
+
+    total_budget = int((fetched.get("settings") or {}).get("waiver_budget") or 100)
+    my_used = teams[match["roster_id"]]["record"].get("waiver_budget_used") or 0
+    my_remaining = total_budget - my_used
+
+    manager_data = await managers(league=league, seasons=None, days=None)
+    others = [
+        p for p in manager_data.get("managers") or [] if p["roster_id"] != match["roster_id"]
+    ]
+    for profile in others:
+        used = teams.get(profile["roster_id"], {}).get("record", {}).get("waiver_budget_used") or 0
+        profile["remaining_budget"] = total_budget - used
+
+    serious_rivals = sorted(
+        (
+            p
+            for p in others
+            if p["remaining_budget"] >= 5 and (p.get("waivers") or {}).get("max_bid")
+        ),
+        key=lambda p: p["waivers"]["max_bid"],
+        reverse=True,
+    )
+    top_rival = serious_rivals[0] if serious_rivals else None
+    baseline = (
+        top_rival["waivers"]["max_bid"]
+        if top_rival
+        else manager_data.get("league_context", {}).get("league_median_max_bid") or 5
+    )
+    margin = {"low": 1.05, "medium": 1.15, "high": 1.3}[confidence]
+    recommended = min(round(baseline * margin), my_remaining) if my_remaining > 0 else 0
+
+    return {
+        "matched_on": manager,
+        "player": players.resolve(player_id) if player_id else None,
+        "your_remaining_budget": my_remaining,
+        "recommended_bid": max(recommended, 0),
+        "affordable": recommended <= my_remaining,
+        "top_rival": (
+            {
+                "display_name": top_rival["display_name"],
+                "team_name": top_rival["team_name"],
+                "typical_bid": top_rival["waivers"]["typical_bid"],
+                "max_bid_ever": top_rival["waivers"]["max_bid"],
+                "remaining_budget": top_rival["remaining_budget"],
+            }
+            if top_rival
+            else None
+        ),
+        "league_median_max_bid": manager_data.get("league_context", {}).get(
+            "league_median_max_bid"
+        ),
+        "note": (
+            "Based on this league's own bidding history from /managers, weighted "
+            "toward whichever rival can both afford and has a habit of a high bid. "
+            "No signal exists about who else actually wants this specific player."
+        ),
+    }
+
+
 @app.post(
     "/leagues/{league}/decision",
     tags=["edge"],
