@@ -989,6 +989,16 @@ services start through `entrypoint.py`, which reads `PORT`.
 `0.0.0.0` where there is no IPv6 stack (some local Docker setups), so the same image runs
 in both places. `HOST` overrides the detection if you need it to.
 
+**A public domain needs `HOST=0.0.0.0` explicitly — confirmed on a live deploy.** The
+`::` auto-detection above is right for the backend and public-data, which only ever
+answer other services over the private network. The MCP connector is the opposite: it
+has a generated public domain and nothing calls it privately, and Railway's public-domain
+edge proxy could not reach a container bound to `::` — the app itself came up cleanly
+(`Uvicorn running on http://[::]:8080`, logs all healthy) while the public URL returned a
+bare `502 Application failed to respond`. Setting `HOST=0.0.0.0` on the MCP service fixed
+it immediately. Set it on whichever service ends up with the public domain; leave it unset
+on the two that only talk over the private network.
+
 ### Verifying
 
 With no public domain on either backend, each one's own health is checked two ways:

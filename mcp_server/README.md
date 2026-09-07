@@ -95,6 +95,13 @@ unit; they share the repo and are wired to each other through Railway's private 
      key on the backend updates this automatically.
    - `MCP_URL_TOKEN` — the secret path segment.
    - `MCP_ALLOWED_HOSTS` — your public MCP hostname.
+   - `HOST=0.0.0.0` — **required**, confirmed on a live deploy. `entrypoint.py` defaults
+     to `::` (IPv6-only), which is what the backend and public-data need for Railway's
+     private network, but the public-domain edge proxy could not reach this service with
+     that default: the container came up cleanly (`Uvicorn running on http://[::]:8080`,
+     every startup log healthy) while the public URL answered a bare `502 Application
+     failed to respond`. This is the only one of the three services with a public domain,
+     so it is the only one that needs this set.
 5. **Networking → Generate Domain**, then set a custom one if you want. This service
    *must* be publicly reachable: Claude connects from Anthropic's infrastructure, not
    from your machine.
