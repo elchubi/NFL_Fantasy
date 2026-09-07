@@ -15,30 +15,63 @@ player file on disk.
 
 ## Endpoints
 
-| Method | Path | Auth | What it returns |
+Base URL is wherever you deployed it. Every endpoint except `/health` requires
+`X-API-Key: <API_KEY>`. `/docs` serves the interactive OpenAPI schema.
+
+### League (Sleeper)
+
+| Method | Endpoint | Params | What it does |
 | --- | --- | --- | --- |
-| `GET` | `/health` | none | Liveness probe for Coolify + player cache status |
-| `GET` | `/snapshot` | `X-API-Key` | The full league: teams, rosters, standings, matchups, transactions |
-| `GET` | `/league-settings` | `X-API-Key` | League configuration translated into plain language |
-| `GET` | `/roster/{manager}` | `X-API-Key` | One resolved roster, found by username or team name |
-| `GET` | `/advanced-stats/{player_id}` | `X-API-Key` | nflverse usage and efficiency for one player |
-| `GET` | `/odds/{week}` | `X-API-Key` | Betting lines for a week (game script signal) |
-| `GET` | `/injury-report/{player_id}` | `X-API-Key` | ESPN injury detail for one player |
-| `GET` | `/injury-report?team={abbr}` | `X-API-Key` | ESPN injury report for a whole team |
-| `GET` | `/weather/{week}` | `X-API-Key` | Kickoff weather for the week's outdoor venues |
-| `GET` | `/stadiums` | `X-API-Key` | The static stadium/dome reference used for weather |
-| `GET` | `/draft-class/{season}` | `X-API-Key` | Rookie draft board: capital, age, combine, landing spot |
-| `GET` | `/prospect/{player_id}` | `X-API-Key` | Draft profile for one player |
-| `GET` | `/managers` | `X-API-Key` | Behavioural profile of every manager in the league |
-| `GET` | `/manager/{name}` | `X-API-Key` | One manager, read against the field |
-| `GET` | `/pressure` | `X-API-Key` | Which teams are structurally forced to act |
-| `POST` | `/decision` | `X-API-Key` | Log a decision and the reasoning behind it |
-| `POST` | `/decision/{id}/outcome` | `X-API-Key` | Record how a logged decision turned out |
-| `GET` | `/decisions` | `X-API-Key` | Read the decision log |
-| `POST` | `/capture` | `X-API-Key` | Archive this week's betting lines and injury reports |
-| `GET` | `/history` | `X-API-Key` | What is in the archive, per source and season |
-| `GET` | `/history/{source}` | `X-API-Key` | Read archived rows (`odds`, `injuries`, `decisions`) |
-| `GET` | `/docs` | none (schema only) | Interactive OpenAPI docs |
+| `GET` | `/health` | — | Liveness probe for Coolify. No auth, no upstream calls; reports cache state. |
+| `GET` | `/snapshot` | `week`, `days=7`, `include` | The whole league: teams, rosters (starters by slot / bench / IR), standings, matchups and transactions, with player IDs resolved to names. `include=advanced_stats,odds,injury_report,weather` attaches the external sources. |
+| `GET` | `/league-settings` | — | League configuration in plain language: scoring, roster slots, playoff format, trade deadline, waiver rules. |
+| `GET` | `/roster/{manager}` | `manager` | One resolved roster. Flexible lookup by username, display name or team name (exact → prefix → substring). `404` lists the teams, `409` the candidates when ambiguous. |
+
+### External sources
+
+| Method | Endpoint | Params | What it does |
+| --- | --- | --- | --- |
+| `GET` | `/advanced-stats/{player_id}` | `player_id`, `season` | nflverse: snap %, target share, air yards, red zone touches, EPA. Season average, last-three-week average and the delta — the earliest read on a role change. |
+| `GET` | `/odds/{week}` | `week`, `season` | The Odds API: spread, total, moneyline, favourite, implied team totals and a game-script note. Consensus is the median across books. Passes through your remaining quota. |
+| `GET` | `/injury-report` | `team` **(required)** | ESPN: a team's full injury report with practice participation (full / limited / did_not_practice). |
+| `GET` | `/injury-report/{player_id}` | `player_id` | ESPN for one player, next to what Sleeper has cached, so you can see when they disagree. |
+| `GET` | `/weather/{week}` | `week`, `season` | Open-Meteo: forecast at the kickoff hour per stadium. Domes return `indoor: true` without any API call. |
+| `GET` | `/stadiums` | — | The static reference: coordinates and roof type for all 32 stadiums. |
+
+### League-specific edge
+
+| Method | Endpoint | Params | What it does |
+| --- | --- | --- | --- |
+| `GET` | `/managers` | `days=180` | Every manager's profile: FAAB behaviour (typical bid, max ever, win rate on contested claims), which day they move, activity, draft tendencies by position and round, trade partners. Plus `league_context` to read one against the field. |
+| `GET` | `/manager/{name}` | `name`, `days=180` | One manager, with the league context. |
+| `GET` | `/pressure` | `week`, `horizon=3` | Who is forced to act: bye-week collisions, stacked injuries, positions with no cover. Ranked by urgency. |
+| `POST` | `/decision` | `kind`, `summary` **(required)**; `reasoning`, `players_involved`, `confidence`, `expected`, `week`, `season` | Log a decision and its reasoning, at the moment you make it. |
+| `POST` | `/decision/{decision_id}/outcome` | `decision_id`, `outcome` **(required)**; `season` | Record how it turned out. Appended, never edited — the original reasoning stays intact. |
+| `GET` | `/decisions` | `season`, `week`, `kind`, `pending_only=false` | Read the decision log with outcomes. |
+
+### Rookie draft
+
+| Method | Endpoint | Params | What it does |
+| --- | --- | --- | --- |
+| `GET` | `/draft-class/{season}` | `season`; `position`, `round_max`, `landing=true` | The full board: draft capital, age, combine measurables and landing spot (how much work vacated at that position on that team). |
+| `GET` | `/prospect/{player_id}` | `player_id`, `season` | One prospect's profile. Accepts a Sleeper id or a `gsis_id`. |
+
+### History
+
+| Method | Endpoint | Params | What it does |
+| --- | --- | --- | --- |
+| `POST` | `/capture` | `week`, `season`, `teams`, `refresh=true` | Archive the week's betting lines and injury reports. Meant for the cron; rows identical to the last recorded state are skipped. |
+| `GET` | `/history` | — | Inventory: rows, weeks and file size per source and season. |
+| `GET` | `/history/{source}` | `source`; `season`, `week`, `limit` | Read archived rows. `source` is `odds`, `injuries` or `decisions`. |
+
+Two things worth knowing before you use these:
+
+- Only `odds` and `injuries` are archived. nflverse, Sleeper and Open-Meteo keep their own
+  history upstream and are re-fetched on demand.
+- The read endpoints archive whatever they pull fresh from upstream automatically (never
+  on a cache hit). `HISTORY_AUTO_CAPTURE=false` turns that off.
+
+## The league endpoints in detail
 
 ### `GET /snapshot`
 
