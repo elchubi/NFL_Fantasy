@@ -1,0 +1,31 @@
+services:
+  sleeper-mcp:
+    build: .
+    container_name: sleeper-fantasy-mcp
+    restart: unless-stopped
+    environment:
+      # Where the REST backend lives. Inside a shared Coolify network this is
+      # the backend's service name; otherwise its public URL.
+      BACKEND_URL: ${BACKEND_URL:?set BACKEND_URL in your .env}
+      # The backend's API key. It stays on this side - the Claude client never
+      # sees it.
+      BACKEND_API_KEY: ${BACKEND_API_KEY:?set BACKEND_API_KEY in your .env}
+      # The secret path segment. This is what protects the server.
+      MCP_URL_TOKEN: ${MCP_URL_TOKEN:?set MCP_URL_TOKEN in your .env}
+      # Public hostname(s), for the transport's Host header check. Without
+      # this, DNS rebinding protection is switched off.
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-}
+      BACKEND_TIMEOUT: ${BACKEND_TIMEOUT:-60}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "${PORT:-8080}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=4).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

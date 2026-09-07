@@ -799,9 +799,18 @@ app/teams.py            Static stadium coordinates, roof types, name aliases
 app/enrichment.py       The optional ?include= blocks on /snapshot
 app/history.py          Append-only JSONL archive + the /capture flow
 tests/                  Offline tests against fixture payloads
+mcp_server/             MCP server exposing this API to Claude.ai (own README)
 Dockerfile              Multi-stage build, non-root, healthcheck
 docker-compose.yml      Example deployment with a persistent cache volume
 ```
+
+## MCP connector
+
+`mcp_server/` is a separate service that wraps this API as an
+[MCP](https://modelcontextprotocol.io) server, so the league can be added to Claude.ai as
+a remote custom connector (Customize → Connectors → Add custom connector). It exposes 21
+tools, one per endpoint, over Streamable HTTP, and keeps `API_KEY` on the server side so
+the Claude client never sees it. See [`mcp_server/README.md`](mcp_server/README.md).
 
 ## Not included (by design)
 
