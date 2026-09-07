@@ -1,9 +1,10 @@
 # Brings up all three services together for local development: the shared
-# public-data service, this league's backend, and its MCP connector. Railway
+# public-data service, the league backend, and its MCP connector. Railway
 # does not use this file - each service deploys independently there (see
-# README's "Deploying on Railway"). Running a second league locally means
-# adding another sleeper-api/sleeper-mcp pair pointed at the same public-data
-# service; see the README for the equivalent on Railway.
+# README's "Deploying on Railway"). Adding a second league means adding
+# another slug:id pair to LEAGUES below - both sleeper-api and sleeper-mcp
+# stay single instances, since one backend and one MCP server can serve any
+# number of leagues.
 services:
   public-data:
     build: ./public_data
@@ -45,12 +46,11 @@ services:
       public-data:
         condition: service_healthy
     environment:
-      LEAGUE_ID: ${LEAGUE_ID:?set LEAGUE_ID in your .env}
+      LEAGUES: ${LEAGUES:?set LEAGUES in your .env, e.g. main:1390746710426255360}
       API_KEY: ${API_KEY:?set API_KEY in your .env}
       PLAYERS_CACHE_PATH: /data/players_cache.json
       CACHE_DIR: /data
       PLAYERS_CACHE_TTL_HOURS: ${PLAYERS_CACHE_TTL_HOURS:-20}
-      DATABASE_PATH: /data/league.db
       HISTORY_AUTO_CAPTURE: ${HISTORY_AUTO_CAPTURE:-true}
       # Reached over the compose network, by service name - not the internet.
       PUBLIC_DATA_URL: http://public-data:8000
@@ -86,6 +86,7 @@ services:
       BACKEND_API_KEY: ${API_KEY:?set API_KEY in your .env}
       MCP_URL_TOKEN: ${MCP_URL_TOKEN:?set MCP_URL_TOKEN in your .env}
       MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-}
+      DEFAULT_LEAGUE: ${DEFAULT_LEAGUE:-}
       PORT: 8080
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     ports:

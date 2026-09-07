@@ -48,10 +48,18 @@ mcp = MCPServer(
     title="Sleeper Fantasy League",
     version=VERSION,
     instructions=(
-        "Read-only access to a Sleeper fantasy football league, with player IDs "
-        "already resolved to names, plus advanced usage stats, betting lines, "
-        "injury reports with practice participation, stadium weather, a rookie "
-        "draft board, opponent profiling and a decision log.\n\n"
+        "Read-only access to one or more Sleeper fantasy football leagues, with "
+        "player IDs already resolved to names, plus advanced usage stats, "
+        "betting lines, injury reports with practice participation, stadium "
+        "weather, a rookie draft board, opponent profiling and a decision "
+        "log.\n\n"
+        "This backend can serve several leagues at once. Every league_*, "
+        "manager_*, decision_* and history_* tool (except history_capture, "
+        "which is shared) takes a `league` argument - call league_list once to "
+        "see what is available. If the server has DEFAULT_LEAGUE configured, "
+        "`league` can be omitted and that one is used automatically; a tool "
+        "call that omits it without a default set fails with a message saying "
+        "so, which is the cue to call league_list.\n\n"
         "Start with league_snapshot for the current state of the league. Use "
         "manager_pressure and manager_list when the question is about trading "
         "with or bidding against another manager - those are specific to this "
@@ -66,6 +74,28 @@ mcp = MCPServer(
         "to this league's own database."
     ),
 )
+
+def _resolve_league(league: str | None) -> str:
+    """The league slug to use for this call.
+
+    This backend can serve several leagues at once, so every per-league tool
+    takes a `league` argument. An explicit one always wins. Otherwise this
+    falls back to `DEFAULT_LEAGUE` (set on the MCP server when it is only ever
+    pointed at one league day to day); with neither set, it tells the model to
+    call `league_list` and choose rather than silently guessing and answering
+    about the wrong league.
+    """
+    if league and league.strip():
+        return league.strip()
+    default = os.getenv("DEFAULT_LEAGUE", "").strip()
+    if default:
+        return default
+    raise ToolError(
+        "No `league` given and DEFAULT_LEAGUE is not configured on this MCP "
+        "server. Call league_list to see which leagues this backend serves, "
+        "then pass one as `league`."
+    )
+
 
 async def _get(path: str, **kwargs: Any) -> Any:
     """GET the backend, surfacing its error message to the model.
@@ -107,6 +137,21 @@ IDEMPOTENT_WRITE = ToolAnnotations(
 
 
 @mcp.tool(
+    name="league_list",
+    annotations=READ_ONLY,
+    description=(
+        "The leagues this backend serves. This backend can host several leagues "
+        "at once, each with its own slug; every other league_*, manager_*, "
+        "decision_* and history_* tool takes that slug as `league`. Call this "
+        "first if `league` is unknown, or if a tool call fails saying no league "
+        "was given."
+    ),
+)
+async def league_list() -> Any:
+    return await _get("/leagues")
+
+
+@mcp.tool(
     name="league_snapshot",
     annotations=READ_ONLY,
     description=(
@@ -118,20 +163,24 @@ IDEMPOTENT_WRITE = ToolAnnotations(
     ),
 )
 async def league_snapshot(
+    league: str | None = None,
     week: int | None = None,
     days: int = 7,
     include: str | None = None,
 ) -> Any:
     """
     Args:
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
         week: NFL week for matchups (1-22). Defaults to the current week.
         days: How many days of transactions to include (1-120).
         include: Comma-separated extras to attach, any of: advanced_stats, odds,
             injury_report, weather. Omit to keep the response small - each one
             costs an upstream fetch.
     """
+    lid = _resolve_league(league)
     return await _get(
-        "/snapshot", params={"week": week, "days": days, "include": include}
+        f"/leagues/{lid}/snapshot", params={"week": week, "days": days, "include": include}
     )
 
 
@@ -146,8 +195,14 @@ async def league_snapshot(
         "trades are still allowed."
     ),
 )
-async def league_settings() -> Any:
-    return await _get("/league-settings")
+async def league_settings(league: str | None = None) -> Any:
+    """
+    Args:
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
+    """
+    lid = _resolve_league(league)
+    return await _get(f"/leagues/{lid}/league-settings")
 
 
 @mcp.tool(
@@ -161,12 +216,15 @@ async def league_settings() -> Any:
         "409 listing the candidates; if it matches none, a 404 listing every team."
     ),
 )
-async def league_roster(manager: str) -> Any:
+async def league_roster(manager: str, league: str | None = None) -> Any:
     """
     Args:
         manager: Username, display name or team name. Partial matches are fine.
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
     """
-    return await _get(f"/roster/{manager}")
+    lid = _resolve_league(league)
+    return await _get(f"/leagues/{lid}/roster/{manager}")
 
 
 # --- External sources ---------------------------------------------------------
@@ -294,15 +352,20 @@ async def stats_stadiums() -> Any:
         "has never bid above $12 is worth more than any projection."
     ),
 )
-async def manager_list(seasons: str | None = None, days: int | None = None) -> Any:
+async def manager_list(
+    league: str | None = None, seasons: str | None = None, days: int | None = None
+) -> Any:
     """
     Args:
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
         seasons: Comma-separated seasons, e.g. "2025,2026". Defaults to every
             season archived by history_backfill.
         days: Only count transactions from the last N days. Omit to use the
             whole archive, which is what makes the profile multi-season.
     """
-    return await _get("/managers", params={"seasons": seasons, "days": days})
+    lid = _resolve_league(league)
+    return await _get(f"/leagues/{lid}/managers", params={"seasons": seasons, "days": days})
 
 
 @mcp.tool(
@@ -314,15 +377,18 @@ async def manager_list(seasons: str | None = None, days: int | None = None) -> A
     ),
 )
 async def manager_profile(
-    name: str, seasons: str | None = None, days: int | None = None
+    name: str, league: str | None = None, seasons: str | None = None, days: int | None = None
 ) -> Any:
     """
     Args:
         name: Username, display name or team name.
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
         seasons: Comma-separated seasons. Defaults to everything archived.
         days: Only count transactions from the last N days.
     """
-    return await _get(f"/manager/{name}", params={"seasons": seasons, "days": days})
+    lid = _resolve_league(league)
+    return await _get(f"/leagues/{lid}/manager/{name}", params={"seasons": seasons, "days": days})
 
 
 @mcp.tool(
@@ -335,13 +401,18 @@ async def manager_profile(
         "over, so check this before proposing a trade."
     ),
 )
-async def manager_pressure(week: int | None = None, horizon: int = 3) -> Any:
+async def manager_pressure(
+    league: str | None = None, week: int | None = None, horizon: int = 3
+) -> Any:
     """
     Args:
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
         week: Week to analyse from. Defaults to the current week.
         horizon: How many weeks ahead to look (1-6).
     """
-    return await _get("/pressure", params={"week": week, "horizon": horizon})
+    lid = _resolve_league(league)
+    return await _get(f"/leagues/{lid}/pressure", params={"week": week, "horizon": horizon})
 
 
 @mcp.tool(
@@ -360,6 +431,7 @@ async def decision_log(
         "waiver_bid", "trade", "start_sit", "draft_pick", "keeper", "drop", "other"
     ],
     summary: str,
+    league: str | None = None,
     reasoning: str | None = None,
     players_involved: str | None = None,
     confidence: str | None = None,
@@ -371,6 +443,8 @@ async def decision_log(
     Args:
         kind: What sort of decision this is.
         summary: One line saying what was decided.
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
         reasoning: Why. This is the part worth having later.
         players_involved: Comma-separated player names.
         confidence: How sure the user was, e.g. low, medium, high.
@@ -378,8 +452,9 @@ async def decision_log(
         week: Defaults to the current week.
         season: Defaults to the current season.
     """
+    lid = _resolve_league(league)
     return await _post(
-        "/decision",
+        f"/leagues/{lid}/decision",
         params={
             "kind": kind,
             "summary": summary,
@@ -403,16 +478,19 @@ async def decision_log(
     ),
 )
 async def decision_log_outcome(
-    decision_id: str, outcome: str, season: int | None = None
+    decision_id: str, outcome: str, league: str | None = None, season: int | None = None
 ) -> Any:
     """
     Args:
         decision_id: The id returned by decision_log.
         outcome: What actually happened.
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
         season: Season the decision was logged in. Defaults to the current one.
     """
+    lid = _resolve_league(league)
     return await _post(
-        f"/decision/{decision_id}/outcome",
+        f"/leagues/{lid}/decision/{decision_id}/outcome",
         params={"outcome": outcome, "season": season},
     )
 
@@ -427,6 +505,7 @@ async def decision_log_outcome(
     ),
 )
 async def decision_list(
+    league: str | None = None,
     season: int | None = None,
     week: int | None = None,
     kind: str | None = None,
@@ -434,13 +513,16 @@ async def decision_list(
 ) -> Any:
     """
     Args:
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
         season: Defaults to the current season.
         week: Filter to one week.
         kind: Filter by decision kind.
         pending_only: Only decisions with no outcome recorded yet.
     """
+    lid = _resolve_league(league)
     return await _get(
-        "/decisions",
+        f"/leagues/{lid}/decisions",
         params={"season": season, "week": week, "kind": kind, "pending_only": pending_only},
     )
 
@@ -540,14 +622,19 @@ async def history_capture(
         "deploying and again when a season ends."
     ),
 )
-async def history_backfill(refresh: bool = False, limit: int = 20) -> Any:
+async def history_backfill(
+    league: str | None = None, refresh: bool = False, limit: int = 20
+) -> Any:
     """
     Args:
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
         refresh: Re-read seasons already archived. A finished season cannot
             change, so this is only useful after a bug fix.
         limit: How many seasons back to walk.
     """
-    return await _post("/backfill", params={"refresh": refresh, "limit": limit})
+    lid = _resolve_league(league)
+    return await _post(f"/leagues/{lid}/backfill", params={"refresh": refresh, "limit": limit})
 
 
 @mcp.tool(
@@ -559,13 +646,16 @@ async def history_backfill(refresh: bool = False, limit: int = 20) -> Any:
         "would pick up before running one."
     ),
 )
-async def history_seasons(discover: bool = False) -> Any:
+async def history_seasons(league: str | None = None, discover: bool = False) -> Any:
     """
     Args:
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
         discover: Follow previous_league_id against Sleeper instead of reading
             what is already archived.
     """
-    return await _get("/seasons", params={"discover": discover})
+    lid = _resolve_league(league)
+    return await _get(f"/leagues/{lid}/seasons", params={"discover": discover})
 
 
 @mcp.tool(
@@ -577,8 +667,14 @@ async def history_seasons(discover: bool = False) -> Any:
         "trying to answer it from the archive."
     ),
 )
-async def history_inventory() -> Any:
-    return await _get("/history")
+async def history_inventory(league: str | None = None) -> Any:
+    """
+    Args:
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
+    """
+    lid = _resolve_league(league)
+    return await _get(f"/leagues/{lid}/history")
 
 
 @mcp.tool(
@@ -592,19 +688,27 @@ async def history_inventory() -> Any:
 )
 async def history_source(
     source: Literal["odds", "injuries", "decisions"],
+    league: str | None = None,
     season: int | None = None,
     week: int | None = None,
     limit: int | None = None,
 ) -> Any:
     """
     Args:
-        source: Which archive to read.
+        source: Which archive to read. "odds" and "injuries" are shared across
+            every league; "decisions" is one league's own.
+        league: A slug from league_list. The backend routes every source
+            through a league even though "odds" and "injuries" do not actually
+            use it. Defaults to DEFAULT_LEAGUE when this server is only ever
+            pointed at one league.
         season: Defaults to the current season.
         week: Filter to one week.
         limit: Return only the most recent N rows.
     """
+    lid = _resolve_league(league)
     return await _get(
-        f"/history/{source}", params={"season": season, "week": week, "limit": limit}
+        f"/leagues/{lid}/history/{source}",
+        params={"season": season, "week": week, "limit": limit},
     )
 
 
@@ -642,6 +746,7 @@ async def healthz(request: Any) -> JSONResponse:
 
 
 TOOL_NAMES = [
+    "league_list",
     "league_snapshot", "league_settings", "league_roster",
     "stats_advanced", "stats_odds", "stats_injury_report_team",
     "stats_injury_report_player", "stats_weather", "stats_stadiums",

@@ -5,7 +5,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ.setdefault("LEAGUE_ID", "1390746710426255360")
+os.environ.setdefault("LEAGUES", "main:1390746710426255360")
 os.environ.setdefault("API_KEY", "test-key")
 
 import pytest  # noqa: E402
@@ -160,6 +160,9 @@ def test_health_is_open_and_endpoints_require_the_api_key():
 
     with TestClient(main.app) as client:
         assert client.get("/health").status_code == 200
-        assert client.get("/snapshot").status_code == 401
-        assert client.get("/snapshot", headers={"X-API-Key": "wrong"}).status_code == 401
-        assert client.get("/roster/elchubi").status_code == 401
+        assert client.get("/leagues/main/snapshot").status_code == 401
+        assert (
+            client.get("/leagues/main/snapshot", headers={"X-API-Key": "wrong"}).status_code
+            == 401
+        )
+        assert client.get("/leagues/main/roster/elchubi").status_code == 401

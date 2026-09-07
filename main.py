@@ -45,21 +45,33 @@ client = SleeperClient()
 # app/public_client.py and public_data/README.md. PlayerStore still keeps its
 # own local disk cache (so roster resolution stays a synchronous, in-memory
 # lookup); it is just hydrated from this client instead of from Sleeper
-# directly.
+# directly. Shared across every league this backend serves, since player data
+# is not per-league.
 public = PublicDataClient(
     settings.public_data_url, settings.public_data_api_key, settings.public_data_timeout
 )
 players = PlayerStore(public)
 
-# The league's own history: transactions, draft picks and roster snapshots
-# across every season in the chain, plus the decision log.
-db = Database(settings.database_file())
+# One SQLite database per configured league - transactions, draft picks and
+# roster snapshots across every season, plus that league's decision log. Kept
+# genuinely separate so a bug in one league's data can never touch another's.
+databases: dict[str, Database] = {
+    slug: Database(settings.database_file(slug)) for slug in settings.league_map
+}
+
+
+def get_db(league: str) -> Database:
+    """The database for one configured league slug, or a 404."""
+    settings.league_id_for(league)  # raises 404 with the same message if unknown
+    return databases[league]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if not settings.league_id:
-        log.warning("LEAGUE_ID is not set; league endpoints will return 503.")
+    if not settings.league_map:
+        log.warning("LEAGUES is not set; every /leagues/{league}/... endpoint will 404.")
+    else:
+        log.info("Serving %d league(s): %s", len(settings.league_map), ", ".join(sorted(settings.league_map)))
     if not settings.api_key:
         log.warning("API_KEY is not set; protected endpoints will return 503.")
     if not settings.public_data_api_key:
@@ -70,12 +82,14 @@ async def lifespan(app: FastAPI):
     # Warm the in-memory copy from disk; the network refresh happens lazily on
     # the first request so a cold public-data service never blocks startup.
     players.load_from_disk()
-    # Opens the file and applies any pending migrations.
-    log.info("Database ready: %s", db.stats())
+    # Opens each league's file and applies any pending migrations.
+    for slug, database in databases.items():
+        log.info("Database ready for '%s': %s", slug, database.stats())
     yield
     await client.aclose()
     await public.aclose()
-    db.close()
+    for database in databases.values():
+        database.close()
 
 
 app = FastAPI(
@@ -97,15 +111,6 @@ app.add_middleware(
 )
 
 
-def league_id() -> str:
-    if not settings.league_id:
-        raise HTTPException(
-            status_code=503,
-            detail="LEAGUE_ID is not configured on the server.",
-        )
-    return settings.league_id
-
-
 @app.get("/health", tags=["ops"], summary="Healthcheck for the platform")
 async def health() -> dict[str, Any]:
     """This service's own liveness.
@@ -118,7 +123,7 @@ async def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "version": __version__,
-        "league_id_configured": bool(settings.league_id),
+        "leagues_configured": sorted(settings.league_map),
         "api_key_configured": bool(settings.api_key),
         "players_cache": players.status(),
         "public_data": {
@@ -129,12 +134,33 @@ async def health() -> dict[str, Any]:
 
 
 @app.get(
-    "/snapshot",
+    "/leagues",
+    tags=["ops"],
+    dependencies=[Depends(require_api_key)],
+    summary="Which leagues this backend serves",
+)
+async def leagues_configured() -> dict[str, Any]:
+    """The slugs configured in LEAGUES - each one is a `/leagues/{slug}/...` prefix.
+
+    A Sleeper league id is not sensitive, so it is included alongside each slug.
+    """
+    return {
+        "count": len(settings.league_map),
+        "leagues": [
+            {"slug": slug, "league_id": league_id}
+            for slug, league_id in sorted(settings.league_map.items())
+        ],
+    }
+
+
+@app.get(
+    "/leagues/{league}/snapshot",
     tags=["league"],
     dependencies=[Depends(require_api_key)],
     summary="Whole league state, fully resolved",
 )
 async def snapshot(
+    league: str = Path(description="A slug from GET /leagues."),
     week: int | None = Query(
         default=None,
         ge=1,
@@ -165,7 +191,7 @@ async def snapshot(
     return await services.build_snapshot(
         client,
         players,
-        league_id(),
+        settings.league_id_for(league),
         week,
         days,
         includes=enrichment.parse_includes(include),
@@ -174,32 +200,35 @@ async def snapshot(
 
 
 @app.get(
-    "/league-settings",
+    "/leagues/{league}/league-settings",
     tags=["league"],
     dependencies=[Depends(require_api_key)],
     summary="League configuration in plain language",
 )
-async def league_settings() -> dict[str, Any]:
+async def league_settings(
+    league: str = Path(description="A slug from GET /leagues."),
+) -> dict[str, Any]:
     """Scoring, roster slots, playoff format, trade deadline and waiver rules."""
-    league = await client.league(league_id())
-    return services.league_settings_view(league)
+    fetched = await client.league(settings.league_id_for(league))
+    return services.league_settings_view(fetched)
 
 
 @app.get(
-    "/roster/{manager}",
+    "/leagues/{league}/roster/{manager}",
     tags=["league"],
     dependencies=[Depends(require_api_key)],
     summary="One resolved roster, found by username or team name",
 )
 async def roster(
+    league: str = Path(description="A slug from GET /leagues."),
     manager: str = Path(
         description="Username, display name or team name (case-insensitive, partial ok)."
     ),
 ) -> dict[str, Any]:
     """A single team's roster without pulling the whole league."""
     await players.ensure_fresh()
-    lid = league_id()
-    league, users, rosters = await asyncio.gather(
+    lid = settings.league_id_for(league)
+    fetched, users, rosters = await asyncio.gather(
         client.league(lid), client.users(lid), client.rosters(lid)
     )
 
@@ -241,11 +270,11 @@ async def roster(
         (r for r in rosters if r.get("roster_id") == match["roster_id"]), {}
     )
     resolved = services.resolve_roster(
-        raw_roster, match, league.get("roster_positions") or [], players
+        raw_roster, match, fetched.get("roster_positions") or [], players
     )
     return {
-        "league_id": league.get("league_id"),
-        "season": league.get("season"),
+        "league_id": fetched.get("league_id"),
+        "season": fetched.get("season"),
         "matched_on": manager,
         "team": resolved,
         "players_cache": players.status(),
@@ -368,12 +397,13 @@ async def stadiums() -> dict[str, Any]:
 
 
 @app.get(
-    "/managers",
+    "/leagues/{league}/managers",
     tags=["edge"],
     dependencies=[Depends(require_api_key)],
     summary="Behavioural profile of every manager in the league",
 )
 async def managers(
+    league: str = Path(description="A slug from GET /leagues."),
     seasons: str | None = Query(
         default=None,
         description=(
@@ -403,7 +433,8 @@ async def managers(
     archived yet.
     """
     await players.ensure_fresh()
-    lid = league_id()
+    lid = settings.league_id_for(league)
+    db = get_db(league)
 
     requested = _parse_seasons(seasons)
     archived = await store.known_season_numbers(db)
@@ -439,7 +470,11 @@ async def managers(
 
     injury_history: list[dict[str, Any]] = []
     for season in target_seasons:
-        injury_history.extend(await store.read_injuries(db, season))
+        try:
+            payload = await public.get("/history/injuries", params={"season": season})
+            injury_history.extend(payload.get("rows") or [])
+        except HTTPException as exc:
+            log.warning("Could not read injury history for season %s: %s", season, exc.detail)
 
     profiles = build_profiles(
         services.build_teams(users, rosters),
@@ -450,6 +485,7 @@ async def managers(
         injury_history=injury_history,
     )
     return {
+        "league": league,
         "league_id": lid,
         "source": source,
         "seasons": sorted(target_seasons, reverse=True),
@@ -480,18 +516,19 @@ def _parse_seasons(raw: str | None) -> list[int]:
 
 
 @app.get(
-    "/manager/{name}",
+    "/leagues/{league}/manager/{name}",
     tags=["edge"],
     dependencies=[Depends(require_api_key)],
     summary="Behavioural profile of one manager",
 )
 async def manager(
+    league: str = Path(description="A slug from GET /leagues."),
     name: str = Path(description="Username, display name or team name."),
     seasons: str | None = Query(default=None),
     days: int | None = Query(default=None, ge=1, le=4000),
 ) -> dict[str, Any]:
     """One manager's profile, read against the rest of the league."""
-    everyone = await managers(seasons=seasons, days=days)
+    everyone = await managers(league=league, seasons=seasons, days=days)
     needle = " ".join(name.strip().lower().split())
 
     match = next(
@@ -527,12 +564,13 @@ async def manager(
 
 
 @app.get(
-    "/pressure",
+    "/leagues/{league}/pressure",
     tags=["edge"],
     dependencies=[Depends(require_api_key)],
     summary="Which teams are structurally forced to act",
 )
 async def pressure(
+    league: str = Path(description="A slug from GET /leagues."),
     week: int | None = Query(default=None, ge=1, le=22),
     horizon: int = Query(
         default=3, ge=1, le=6, description="How many weeks ahead to look."
@@ -543,14 +581,14 @@ async def pressure(
     A team that has to move before you do is a team you have leverage over.
     """
     await players.ensure_fresh()
-    lid = league_id()
-    state, league, users, rosters = await asyncio.gather(
+    lid = settings.league_id_for(league)
+    state, fetched_league, users, rosters = await asyncio.gather(
         client.nfl_state(), client.league(lid), client.users(lid), client.rosters(lid)
     )
 
     target_week = week or services.current_week(state)
-    season = services._season_number(state, league)
-    roster_positions = league.get("roster_positions") or []
+    season = services._season_number(state, fetched_league)
+    roster_positions = fetched_league.get("roster_positions") or []
     teams = services.build_teams(users, rosters)
 
     byes_response = await public.get(f"/byes/{season}") if season else {}
@@ -569,12 +607,13 @@ async def pressure(
 
 
 @app.post(
-    "/decision",
+    "/leagues/{league}/decision",
     tags=["edge"],
     dependencies=[Depends(require_api_key)],
     summary="Log a decision you made, and why",
 )
 async def log_decision(
+    league: str = Path(description="A slug from GET /leagues."),
     kind: str = Query(description="waiver_bid, trade, start_sit, draft_pick, keeper, drop, other."),
     summary: str = Query(description="What you decided, in one line."),
     reasoning: str | None = Query(default=None, description="Why you decided it."),
@@ -591,6 +630,7 @@ async def log_decision(
     Recorded at the moment you make it, before you know how it turned out -
     which is the only version worth having later.
     """
+    db = get_db(league)
     target_season = season or await current_season()
     target_week = week or await current_week_number()
     row = decision_row(
@@ -606,17 +646,19 @@ async def log_decision(
 
 
 @app.post(
-    "/decision/{decision_id}/outcome",
+    "/leagues/{league}/decision/{decision_id}/outcome",
     tags=["edge"],
     dependencies=[Depends(require_api_key)],
     summary="Record how a logged decision turned out",
 )
 async def log_outcome(
+    league: str = Path(description="A slug from GET /leagues."),
     decision_id: str = Path(description="The decision_id returned by POST /decision."),
     outcome: str = Query(description="What actually happened."),
     season: int | None = Query(default=None, ge=1999, le=2100),
 ) -> dict[str, Any]:
     """Append the outcome. The original call is never edited, only layered on."""
+    db = get_db(league)
     target_season = season or await current_season()
     original = await store.find_decision(db, target_season, decision_id)
     if original is None:
@@ -630,12 +672,13 @@ async def log_outcome(
 
 
 @app.get(
-    "/decisions",
+    "/leagues/{league}/decisions",
     tags=["edge"],
     dependencies=[Depends(require_api_key)],
     summary="Read the decision log",
 )
 async def decisions(
+    league: str = Path(description="A slug from GET /leagues."),
     season: int | None = Query(default=None, ge=1999, le=2100),
     week: int | None = Query(default=None, ge=1, le=22),
     kind: str | None = Query(default=None, description="Filter by decision kind."),
@@ -644,6 +687,7 @@ async def decisions(
     ),
 ) -> dict[str, Any]:
     """Your decisions with their outcomes, oldest first."""
+    db = get_db(league)
     target_season = season or await current_season()
     rows = await store.read_decisions(db, target_season, week=week)
     if kind:
@@ -711,12 +755,13 @@ async def prospect(
 
 
 @app.post(
-    "/backfill",
+    "/leagues/{league}/backfill",
     tags=["history"],
     dependencies=[Depends(require_api_key)],
     summary="Archive every season of the league",
 )
 async def backfill(
+    league: str = Path(description="A slug from GET /leagues."),
     refresh: bool = Query(
         default=False,
         description=(
@@ -730,24 +775,27 @@ async def backfill(
 ) -> dict[str, Any]:
     """Walk `previous_league_id` and archive each season's history.
 
-    In Sleeper every season is a separate league, so a single LEAGUE_ID only
-    ever reaches the current one. This follows the chain backwards and stores
-    transactions, draft picks, managers and final rosters for each season it
-    finds. Run it once after deploying, then whenever a season ends.
+    In Sleeper every season is a separate league, so a single Sleeper league id
+    only ever reaches the current season. This follows the chain backwards and
+    stores transactions, draft picks, managers and final rosters for each
+    season it finds. Run it once after deploying, then whenever a season ends.
 
     Finished seasons are skipped on a re-run since they cannot change; the
     season in progress is always re-read.
     """
-    return await backfill_all(client, db, league_id(), refresh=refresh, limit=limit)
+    return await backfill_all(
+        client, get_db(league), settings.league_id_for(league), refresh=refresh, limit=limit
+    )
 
 
 @app.get(
-    "/seasons",
+    "/leagues/{league}/seasons",
     tags=["history"],
     dependencies=[Depends(require_api_key)],
     summary="The league's season chain",
 )
 async def seasons_endpoint(
+    league: str = Path(description="A slug from GET /leagues."),
     discover: bool = Query(
         default=False,
         description="Follow previous_league_id live instead of reading the archive.",
@@ -759,21 +807,21 @@ async def seasons_endpoint(
     Sleeper, which is how to see what a backfill would pick up before running it.
     """
     if discover:
-        chain = await discover_chain(client, league_id())
+        chain = await discover_chain(client, settings.league_id_for(league))
         return {
             "source": "sleeper",
             "seasons": [
                 {
-                    "season": league.get("season"),
-                    "league_id": league.get("league_id"),
-                    "name": league.get("name"),
-                    "status": league.get("status"),
-                    "previous_league_id": league.get("previous_league_id"),
+                    "season": entry.get("season"),
+                    "league_id": entry.get("league_id"),
+                    "name": entry.get("name"),
+                    "status": entry.get("status"),
+                    "previous_league_id": entry.get("previous_league_id"),
                 }
-                for league in chain
+                for entry in chain
             ],
         }
-    return {"source": "archive", "seasons": await store.seasons(db)}
+    return {"source": "archive", "seasons": await store.seasons(get_db(league))}
 
 
 @app.post(
@@ -818,18 +866,21 @@ async def capture(
 
 
 @app.get(
-    "/history",
+    "/leagues/{league}/history",
     tags=["history"],
     dependencies=[Depends(require_api_key)],
     summary="What is in the archive",
 )
-async def history_inventory() -> dict[str, Any]:
+async def history_inventory(
+    league: str = Path(description="A slug from GET /leagues."),
+) -> dict[str, Any]:
     """Rows, weeks and file sizes per source and season.
 
     Merges this league's own archive (transactions, draft picks, roster
     snapshots, decisions) with the odds/injury archive from the shared
     public-data service.
     """
+    db = get_db(league)
     league_stats, public_history = await asyncio.gather(
         store.inventory(db), public.get("/history")
     )
@@ -846,12 +897,13 @@ async def history_inventory() -> dict[str, Any]:
 
 
 @app.get(
-    "/history/{source}",
+    "/leagues/{league}/history/{source}",
     tags=["history"],
     dependencies=[Depends(require_api_key)],
     summary="Read archived rows for one source",
 )
 async def history_rows(
+    league: str = Path(description="A slug from GET /leagues."),
     source: str = Path(description=f"One of: {', '.join(HISTORY_SOURCES)}."),
     season: int | None = Query(default=None, ge=1999, le=2100),
     week: int | None = Query(default=None, ge=1, le=22),
@@ -876,6 +928,7 @@ async def history_rows(
         return await public.get(
             f"/history/{source}", params={"season": season, "week": week, "limit": limit}
         )
+    db = get_db(league)
     target_season = season or await current_season()
     rows = await store.read_decisions(db, target_season, week=week)
     rows = rows[-limit:] if limit else rows

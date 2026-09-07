@@ -69,7 +69,7 @@ def test_every_tool_is_listed_with_a_description(app):
 
     names = {t["name"] for t in tools}
     assert names == set(server.TOOL_NAMES)
-    assert len(names) == 23
+    assert len(names) == 24
     for tool in tools:
         # The description is what the model reads to decide whether to call it,
         # so an empty or stub one is a real defect.
@@ -172,6 +172,7 @@ def test_a_backend_error_reaches_the_model_with_its_message(app, monkeypatch):
 def test_a_successful_call_returns_the_backend_payload(app):
     async def ok(request: httpx.Request) -> httpx.Response:
         assert request.headers["x-api-key"] == "test-backend-key"
+        assert request.url.path == "/leagues/main/snapshot"
         return httpx.Response(200, json={"week": 7, "teams": []}, request=request)
 
     server.backend._client = httpx.AsyncClient(
@@ -185,12 +186,54 @@ def test_a_successful_call_returns_the_backend_payload(app):
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "tools/call",
-                "params": {"name": "league_snapshot", "arguments": {"week": 7}},
+                "params": {"name": "league_snapshot", "arguments": {"league": "main", "week": 7}},
             },
         )["result"]
 
     assert result.get("isError") is not True
     assert json.loads(result["content"][0]["text"])["week"] == 7
+
+
+def test_a_league_tool_without_league_or_default_asks_to_pick_one(app):
+    with TestClient(app) as client:
+        _call(client, INITIALIZE)
+        result = _call(
+            client,
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "league_snapshot", "arguments": {}},
+            },
+        )["result"]
+
+    assert result["isError"] is True
+    assert "league_list" in result["content"][0]["text"]
+
+
+def test_default_league_is_used_when_the_call_omits_one(app, monkeypatch):
+    monkeypatch.setenv("DEFAULT_LEAGUE", "main")
+
+    async def ok(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/leagues/main/league-settings"
+        return httpx.Response(200, json={"format": {}}, request=request)
+
+    server.backend._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(ok), base_url="http://backend:8000"
+    )
+    with TestClient(app) as client:
+        _call(client, INITIALIZE)
+        result = _call(
+            client,
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "league_settings", "arguments": {}},
+            },
+        )["result"]
+
+    assert result.get("isError") is not True
 
 
 def test_the_health_route_is_outside_the_token_path(app):
@@ -200,7 +243,7 @@ def test_the_health_route_is_outside_the_token_path(app):
         assert response.status_code == 200
         body = response.json()
         assert body["status"] == "ok"
-        assert body["tools"] == 23
+        assert body["tools"] == 24
         assert body["backend_api_key_configured"] is True
 
 
