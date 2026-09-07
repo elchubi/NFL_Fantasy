@@ -1,9 +1,8 @@
-"""Append-only archive for the two sources that cannot be re-fetched later.
+"""Capturing the two sources that cannot be re-fetched later.
 
-Everything else this service reads stays available upstream forever: nflverse
-publishes a file per season going back to 1999, Sleeper keeps past seasons
-reachable through `previous_league_id`, and Open-Meteo has a historical archive
-API. Re-storing those would duplicate a better-maintained public archive.
+Everything else this service reads stays available upstream: nflverse publishes
+a file per season going back to 1999, Sleeper keeps past seasons reachable
+through `previous_league_id`, and Open-Meteo has a historical archive API.
 
 Two things do evaporate:
 
@@ -14,221 +13,32 @@ Two things do evaporate:
               overwritten by Thursday's "full", and once the week passes there
               is no record that either happened.
 
-Those are captured here as JSON Lines, one file per season and source, appended
-to and never rewritten. A capture that would write a row identical to the last
-one recorded for the same subject is skipped, so running the cron more often
-than the lines move costs nothing but still records every real change.
+Both go into SQLite as append-only histories: a row is written only when the
+subject actually changed, so the sequence of rows is the history. Storage lives
+in `app/store.py`; this module is the capture logic over it.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import uuid
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
+
+from app import store
+from app.db import Database
 
 log = logging.getLogger(__name__)
 
 SOURCES = ("odds", "injuries", "decisions")
 
-# Decisions are a log, not a state snapshot: every entry is kept, including two
-# identical ones, because "I made the same call again" is itself a fact.
-APPEND_ALWAYS = ("decisions",)
+DECISION_KINDS = (
+    "waiver_bid", "trade", "start_sit", "draft_pick", "keeper", "drop", "other",
+)
 
-# Fields compared to decide whether a row is a real change or a repeat.
-CHANGE_FIELDS: dict[str, tuple[str, ...]] = {
-    "odds": ("home_spread", "away_spread", "total", "favourite", "moneyline"),
-    "injuries": ("status", "practice_participation", "injury_type", "return_date"),
-    "decisions": (),
-}
-
-# What identifies the subject of a row within a (season, week).
-SUBJECT_FIELDS: dict[str, tuple[str, ...]] = {
-    "odds": ("game_id",),
-    "injuries": ("team", "espn_id", "name"),
-    "decisions": ("decision_id",),
-}
-
-
-class HistoryStore:
-    """One JSON Lines file per source per season, appended to forever."""
-
-    def __init__(self, directory: str | Path) -> None:
-        self.directory = Path(directory)
-        self._lock = asyncio.Lock()
-        # Last recorded state per subject, per (source, season, week). Built
-        # from the file the first time a week is touched and updated on every
-        # append, so a capture does not re-read the whole season to work out
-        # what changed. With more than one worker process the memos can drift,
-        # which at worst writes a duplicate row - the app runs single-worker.
-        self._index: dict[tuple[str, int, int], dict[tuple, dict[str, Any]]] = {}
-
-    def path_for(self, source: str, season: int) -> Path:
-        return self.directory / f"{source}_{season}.jsonl"
-
-    # --- Reading --------------------------------------------------------------
-
-    def read(
-        self,
-        source: str,
-        season: int,
-        *,
-        week: int | None = None,
-        limit: int | None = None,
-    ) -> list[dict[str, Any]]:
-        rows = [
-            row
-            for row in self._iter_rows(self.path_for(source, season))
-            if week is None or row.get("week") == week
-        ]
-        return rows[-limit:] if limit else rows
-
-    @staticmethod
-    def _iter_rows(path: Path) -> Iterator[dict[str, Any]]:
-        try:
-            with path.open("r", encoding="utf-8") as fh:
-                for line_number, line in enumerate(fh, start=1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        yield json.loads(line)
-                    except ValueError:
-                        # A torn final line from an interrupted write should not
-                        # make the whole archive unreadable.
-                        log.warning("Skipping malformed line %s in %s", line_number, path)
-        except FileNotFoundError:
-            return
-
-    def _latest_by_subject(self, source: str, season: int, week: int) -> dict[tuple, dict[str, Any]]:
-        """The most recent row recorded for each subject in this week."""
-        memo_key = (source, season, week)
-        cached = self._index.get(memo_key)
-        if cached is not None:
-            return cached
-
-        latest: dict[tuple, dict[str, Any]] = {}
-        for row in self.read(source, season, week=week):
-            latest[self._subject_key(source, row)] = row
-        self._index[memo_key] = latest
-        return latest
-
-    @staticmethod
-    def _subject_key(source: str, row: dict[str, Any]) -> tuple:
-        return tuple(row.get(field) for field in SUBJECT_FIELDS[source])
-
-    @staticmethod
-    def _changed(source: str, new: dict[str, Any], previous: dict[str, Any] | None) -> bool:
-        if source in APPEND_ALWAYS:
-            return True
-        if previous is None:
-            return True
-        return any(
-            new.get(field) != previous.get(field) for field in CHANGE_FIELDS[source]
-        )
-
-    # --- Writing --------------------------------------------------------------
-
-    async def append(
-        self,
-        source: str,
-        season: int,
-        week: int,
-        rows: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        """Append rows that differ from the last recorded state.
-
-        Returns counts rather than the rows, so a cron call has something short
-        to log.
-        """
-        if source not in SOURCES:
-            raise ValueError(f"Unknown history source '{source}'.")
-
-        async with self._lock:
-            latest = self._latest_by_subject(source, season, week)
-            captured_at = datetime.now(timezone.utc).isoformat()
-
-            new_rows: list[dict[str, Any]] = []
-            for row in rows:
-                enriched = {
-                    "captured_at": captured_at,
-                    "season": season,
-                    "week": week,
-                    **row,
-                }
-                previous = latest.get(self._subject_key(source, enriched))
-                if self._changed(source, enriched, previous):
-                    new_rows.append(enriched)
-
-            if not new_rows:
-                return {"source": source, "written": 0, "skipped": len(rows), "unchanged": True}
-
-            path = self.path_for(source, season)
-            try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                payload = "".join(
-                    json.dumps(row, ensure_ascii=False) + "\n" for row in new_rows
-                )
-                # If a previous write was interrupted the file may not end in a
-                # newline; starting on a fresh line keeps that damage confined
-                # to the torn line instead of also corrupting this one.
-                if _needs_leading_newline(path):
-                    payload = "\n" + payload
-                # One O_APPEND write so a concurrent capture cannot interleave.
-                with path.open("a", encoding="utf-8") as fh:
-                    fh.write(payload)
-            except OSError as exc:
-                log.warning("Could not append history to %s: %s", path, exc)
-                return {"source": source, "written": 0, "error": str(exc)}
-
-            for row in new_rows:
-                latest[self._subject_key(source, row)] = row
-
-            return {
-                "source": source,
-                "written": len(new_rows),
-                "skipped": len(rows) - len(new_rows),
-                "unchanged": False,
-                "file": str(path),
-            }
-
-    # --- Inventory ------------------------------------------------------------
-
-    def inventory(self) -> dict[str, Any]:
-        """What is archived, per source and season."""
-        summary: dict[str, Any] = {}
-        for source in SOURCES:
-            seasons: dict[str, Any] = {}
-            for path in sorted(self.directory.glob(f"{source}_*.jsonl")):
-                season = path.stem.rsplit("_", 1)[-1]
-                weeks: set[int] = set()
-                rows = 0
-                for row in self._iter_rows(path):
-                    rows += 1
-                    if isinstance(row.get("week"), int):
-                        weeks.add(row["week"])
-                seasons[season] = {
-                    "rows": rows,
-                    "weeks": sorted(weeks),
-                    "size_kb": round(path.stat().st_size / 1024, 1),
-                }
-            summary[source] = seasons
-        return summary
-
-
-def _needs_leading_newline(path: Path) -> bool:
-    """True when the file exists, is non-empty and does not end in a newline."""
-    try:
-        size = path.stat().st_size
-        if size == 0:
-            return False
-        with path.open("rb") as fh:
-            fh.seek(-1, 2)
-            return fh.read(1) != b"\n"
-    except (OSError, ValueError):
-        return False
+# ESPN is free and unmetered, but 32 simultaneous requests is impolite.
+ESPN_CONCURRENCY = 6
 
 
 # --- Row shaping --------------------------------------------------------------
@@ -275,14 +85,56 @@ def injury_rows(team: str, injuries: list[dict[str, Any]]) -> list[dict[str, Any
     ]
 
 
-# --- Capture ------------------------------------------------------------------
+def decision_row(
+    *,
+    kind: str,
+    summary: str,
+    reasoning: str | None = None,
+    players: list[str] | None = None,
+    confidence: str | None = None,
+    expected: str | None = None,
+    decision_id: str | None = None,
+) -> dict[str, Any]:
+    """One entry in the decision log.
 
-# ESPN is free and unmetered, but 32 simultaneous requests is impolite.
-ESPN_CONCURRENCY = 6
+    The point is not record-keeping for its own sake. Two seasons of these, read
+    against what actually happened, is the only way to find out where your
+    process is systematically wrong. No public tool can tell you, because none
+    of them knows what you decided or why.
+    """
+    return {
+        "decision_id": decision_id or uuid.uuid4().hex[:12],
+        "kind": kind if kind in DECISION_KINDS else "other",
+        "kind_raw": kind,
+        "summary": summary,
+        "reasoning": reasoning,
+        "players": players or [],
+        "confidence": confidence,
+        "expected": expected,
+        "outcome": None,
+        "outcome_recorded_at": None,
+    }
+
+
+def outcome_row(original: dict[str, Any], outcome: str) -> dict[str, Any]:
+    """The follow-up entry recording how a decision turned out.
+
+    Appended rather than edited: the original call is preserved exactly as it
+    was made, which is the part that matters when checking your own reasoning
+    against what happened.
+    """
+    return {
+        **{k: v for k, v in original.items() if not k.startswith("_")},
+        "outcome": outcome,
+        "outcome_recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# --- Capture ------------------------------------------------------------------
 
 
 async def capture_week(
-    store: HistoryStore,
+    db: Database,
     *,
     odds_provider: Any,
     espn_provider: Any,
@@ -293,14 +145,14 @@ async def capture_week(
 ) -> dict[str, Any]:
     """Archive this week's betting lines and injury reports.
 
-    `refresh=True` bypasses the read caches so the archived line is the one
-    live at capture time rather than whatever a browsing request happened to
-    warm the cache with hours earlier. That is the whole point of capturing on
-    a schedule, so it defaults on.
+    `refresh=True` bypasses the read caches so the archived line is the one live
+    at capture time rather than whatever a browsing request warmed the cache
+    with hours earlier. That is the point of capturing on a schedule, so it
+    defaults on.
     """
     odds_result, injuries_result = await asyncio.gather(
-        _capture_odds(store, odds_provider, season, week, refresh),
-        _capture_injuries(store, espn_provider, season, week, teams, refresh),
+        _capture_odds(db, odds_provider, season, week, refresh),
+        _capture_injuries(db, espn_provider, season, week, teams, refresh),
     )
     return {
         "season": season,
@@ -312,7 +164,7 @@ async def capture_week(
 
 
 async def _capture_odds(
-    store: HistoryStore, provider: Any, season: int, week: int, refresh: bool
+    db: Database, provider: Any, season: int, week: int, refresh: bool
 ) -> dict[str, Any]:
     if not provider.configured:
         return {
@@ -334,13 +186,13 @@ async def _capture_odds(
         log.warning("Odds capture failed: %s", exc)
         return {"written": 0, "skipped": 0, "error": str(getattr(exc, "detail", exc))}
 
-    result = await store.append("odds", season, week, odds_rows(games))
+    result = await store.append_odds(db, season, week, odds_rows(games))
     result["games_seen"] = len(games)
     return result
 
 
 async def _capture_injuries(
-    store: HistoryStore,
+    db: Database,
     provider: Any,
     season: int,
     week: int,
@@ -372,7 +224,7 @@ async def _capture_injuries(
             continue
         rows.extend(injury_rows(team, outcome))
 
-    result = await store.append("injuries", season, week, rows)
+    result = await store.append_injuries(db, season, week, rows)
     result["teams_captured"] = len(teams) - len(failures)
     if failures:
         result["teams_failed"] = failures
@@ -383,116 +235,34 @@ async def _capture_injuries(
 
 
 async def auto_capture(
-    store: HistoryStore,
+    db: Database,
     source: str,
     season: int | None,
     week: int | None,
     rows: list[dict[str, Any]],
 ) -> None:
-    """Archive rows that a read endpoint just pulled from upstream.
+    """Archive rows a read endpoint just pulled from upstream.
 
-    Best-effort by design: this runs on the path of an ordinary read request,
-    so a broken archive must never turn a working `/odds` call into a 500. Any
+    Best-effort by design: this runs on the path of an ordinary read request, so
+    a broken archive must never turn a working `/odds` call into a 500. Any
     failure is logged and swallowed.
 
-    Only call this when the data actually came from upstream. Archiving a cache
-    hit would re-scan the archive just to conclude nothing changed.
+    Only call this when the data actually came from upstream; archiving a cache
+    hit would query the archive just to conclude nothing changed.
     """
     if not rows or season is None or week is None:
         return
     try:
-        result = await store.append(source, season, week, rows)
+        if source == "odds":
+            result = await store.append_odds(db, season, week, rows)
+        elif source == "injuries":
+            result = await store.append_injuries(db, season, week, rows)
+        else:
+            return
         if result.get("written"):
             log.info(
                 "Auto-captured %s row(s) of %s for %s week %s.",
-                result["written"],
-                source,
-                season,
-                week,
+                result["written"], source, season, week,
             )
     except Exception as exc:  # noqa: BLE001 - never fail the read it rode in on
         log.warning("Auto-capture of %s failed: %s", source, exc)
-
-
-# --- Decision log -------------------------------------------------------------
-
-DECISION_KINDS = (
-    "waiver_bid",
-    "trade",
-    "start_sit",
-    "draft_pick",
-    "keeper",
-    "drop",
-    "other",
-)
-
-
-def decision_row(
-    *,
-    kind: str,
-    summary: str,
-    reasoning: str | None = None,
-    players: list[str] | None = None,
-    confidence: str | None = None,
-    expected: str | None = None,
-    decision_id: str | None = None,
-) -> dict[str, Any]:
-    """One entry in the decision log.
-
-    The point is not record-keeping for its own sake. Two seasons of these,
-    read against what actually happened, is the only way to find out where your
-    process is systematically wrong - whether you overpay on waivers, whether
-    your close start/sit calls are coin flips. No public tool can tell you that
-    because no public tool knows what you decided or why.
-    """
-    import uuid
-
-    return {
-        "decision_id": decision_id or uuid.uuid4().hex[:12],
-        "kind": kind if kind in DECISION_KINDS else "other",
-        "kind_raw": kind,
-        "summary": summary,
-        "reasoning": reasoning,
-        "players": players or [],
-        "confidence": confidence,
-        "expected": expected,
-        "outcome": None,
-        "outcome_recorded_at": None,
-    }
-
-
-def apply_outcome(
-    rows: list[dict[str, Any]], decision_id: str, outcome: str
-) -> dict[str, Any] | None:
-    """Build the follow-up row that records how a decision turned out.
-
-    Outcomes are appended rather than edited: the archive stays append-only, and
-    the original call is preserved exactly as it was made, which is the part
-    that matters when you go back to check your reasoning.
-    """
-    original = next((r for r in rows if r.get("decision_id") == decision_id), None)
-    if original is None:
-        return None
-    return {
-        **{k: v for k, v in original.items() if k not in ("captured_at", "season", "week")},
-        "outcome": outcome,
-        "outcome_recorded_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-def pair_decisions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Collapse the log into one entry per decision, newest outcome applied."""
-    by_id: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        decision_id = row.get("decision_id")
-        if not decision_id:
-            continue
-        existing = by_id.get(decision_id)
-        if existing is None:
-            by_id[decision_id] = dict(row)
-            continue
-        # Keep the original call; layer any outcome recorded later on top.
-        if row.get("outcome"):
-            existing["outcome"] = row["outcome"]
-            existing["outcome_recorded_at"] = row.get("outcome_recorded_at")
-    return sorted(by_id.values(), key=lambda r: r.get("captured_at") or "")

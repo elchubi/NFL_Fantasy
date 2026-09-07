@@ -69,7 +69,7 @@ def test_every_tool_is_listed_with_a_description(app):
 
     names = {t["name"] for t in tools}
     assert names == set(server.TOOL_NAMES)
-    assert len(names) == 21
+    assert len(names) == 23
     for tool in tools:
         # The description is what the model reads to decide whether to call it,
         # so an empty or stub one is a real defect.
@@ -85,7 +85,9 @@ def test_annotations_mark_what_moves_state(app):
         )["result"]["tools"]
     by_name = {t["name"]: t.get("annotations") or {} for t in tools}
 
-    writers = {"decision_log", "decision_log_outcome", "history_capture"}
+    writers = {
+        "decision_log", "decision_log_outcome", "history_capture", "history_backfill",
+    }
     for name, annotations in by_name.items():
         if name in writers:
             assert annotations.get("readOnlyHint") is False, name
@@ -94,9 +96,11 @@ def test_annotations_mark_what_moves_state(app):
         else:
             assert annotations.get("readOnlyHint") is True, name
 
-    # Capture skips rows identical to the last recorded state, so repeating it
-    # is safe; the decision log records every call on purpose and is not.
+    # Capture skips rows identical to the last recorded state and backfill skips
+    # finished seasons, so repeating either is safe; the decision log records
+    # every call on purpose and is not idempotent.
     assert by_name["history_capture"].get("idempotentHint") is True
+    assert by_name["history_backfill"].get("idempotentHint") is True
     assert by_name["decision_log"].get("idempotentHint") is not True
 
 
@@ -109,7 +113,12 @@ def test_tool_schemas_carry_the_documented_defaults(app):
     schemas = {t["name"]: t["inputSchema"] for t in tools}
 
     assert schemas["league_snapshot"]["properties"]["days"]["default"] == 7
-    assert schemas["manager_list"]["properties"]["days"]["default"] == 180
+    # manager_list's `days` now defaults to null rather than 180: omitting it
+    # means "use the whole archive", which is what makes the profile
+    # multi-season instead of one season deep.
+    assert schemas["manager_list"]["properties"]["days"]["default"] is None
+    assert schemas["manager_list"]["properties"]["seasons"]["default"] is None
+    assert schemas["history_backfill"]["properties"]["limit"]["default"] == 20
     assert schemas["manager_pressure"]["properties"]["horizon"]["default"] == 3
     assert schemas["history_capture"]["properties"]["refresh"]["default"] is True
     assert schemas["draft_class"]["properties"]["landing"]["default"] is True
@@ -191,7 +200,7 @@ def test_the_health_route_is_outside_the_token_path(app):
         assert response.status_code == 200
         body = response.json()
         assert body["status"] == "ok"
-        assert body["tools"] == 21
+        assert body["tools"] == 23
         assert body["backend_api_key_configured"] is True
 
 

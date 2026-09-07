@@ -42,8 +42,8 @@ Base URL is wherever you deployed it. Every endpoint except `/health` requires
 
 | Method | Endpoint | Params | What it does |
 | --- | --- | --- | --- |
-| `GET` | `/managers` | `days=180` | Every manager's profile: FAAB behaviour (typical bid, max ever, win rate on contested claims), which day they move, activity, draft tendencies by position and round, trade partners. Plus `league_context` to read one against the field. |
-| `GET` | `/manager/{name}` | `name`, `days=180` | One manager, with the league context. |
+| `GET` | `/managers` | `seasons`, `days` | Every manager's profile: FAAB behaviour (typical bid, max ever, win rate on contested claims), which day they move, activity, draft tendencies by position and round, trade partners. Plus `league_context` to read one against the field. |
+| `GET` | `/manager/{name}` | `name`, `seasons`, `days` | One manager, with the league context. |
 | `GET` | `/pressure` | `week`, `horizon=3` | Who is forced to act: bye-week collisions, stacked injuries, positions with no cover. Ranked by urgency. |
 | `POST` | `/decision` | `kind`, `summary` **(required)**; `reasoning`, `players_involved`, `confidence`, `expected`, `week`, `season` | Log a decision and its reasoning, at the moment you make it. |
 | `POST` | `/decision/{decision_id}/outcome` | `decision_id`, `outcome` **(required)**; `season` | Record how it turned out. Appended, never edited — the original reasoning stays intact. |
@@ -60,6 +60,8 @@ Base URL is wherever you deployed it. Every endpoint except `/health` requires
 
 | Method | Endpoint | Params | What it does |
 | --- | --- | --- | --- |
+| `POST` | `/backfill` | `refresh=false`, `limit=20` | Walk `previous_league_id` and archive every season's transactions, draft picks and managers. Run once after deploying, then when a season ends. |
+| `GET` | `/seasons` | `discover=false` | The league's season chain. `discover=true` follows it against Sleeper instead of reading the archive. |
 | `POST` | `/capture` | `week`, `season`, `teams`, `refresh=true` | Archive the week's betting lines and injury reports. Meant for the cron; rows identical to the last recorded state are skipped. |
 | `GET` | `/history` | — | Inventory: rows, weeks and file size per source and season. |
 | `GET` | `/history/{source}` | `source`; `season`, `week`, `limit` | Read archived rows. `source` is `odds`, `injuries` or `decisions`. |
@@ -501,113 +503,136 @@ can tell you, because none of them knows what you decided or why.
 
 ## Keeping history
 
-The league runs for years; the caches above do not. They are overwritten on every
-refresh, so the question is what would actually be lost.
+The league runs for years and the caches do not, so the question is what would be lost
+and what has to be stored.
 
-**Three of the five sources lose nothing.** They keep their own history upstream and are
-re-fetched on demand:
+**Three of the external sources lose nothing.** They keep their own history upstream and
+are re-fetched on demand:
 
 | Source | Still available later? | |
 | --- | --- | --- |
 | nflverse | Yes | A file per season, back to 1999 for play-by-play. **Verified: 2018-2025 all resolve** |
-| Sleeper | Yes | Past seasons chain through `previous_league_id`; past weeks stay queryable |
 | Open-Meteo | Yes | Free historical archive API |
-| **The Odds API** | **No** | The free tier only returns upcoming games. A closing line is gone once the game kicks off (historical odds are a paid add-on) |
-| **ESPN injuries** | **No** | No historical endpoint exists. Wednesday's "limited" is overwritten by Thursday's "full", and after the week there is no record either happened |
+| **The Odds API** | **No** | The free tier only returns upcoming games. A closing line is gone once the game kicks off |
+| **ESPN injuries** | **No** | No historical endpoint exists. Wednesday's "limited" is overwritten by Thursday's "full" |
 
-So this service archives **only the two that evaporate**. Re-storing the other three
-would duplicate public archives that are better maintained than anything kept here, and
-leave a schema to migrate for years.
+**Sleeper is the subtle one.** Past seasons stay reachable, but *not* through your league
+id: in Sleeper **every season is a separate league**, chained backwards by
+`previous_league_id`. A single `LEAGUE_ID` only ever reaches the current season, which is
+why manager profiling was one season deep until `/backfill` existed.
 
-Capture happens two ways, and they cover each other's gaps.
+### The database
 
-### 1. Automatically, on every read
+Everything the league needs remembered lives in one SQLite file (`DATABASE_PATH`,
+`/data/league.db` by default):
 
-Whenever `/odds`, `/injury-report` or a `/snapshot?include=odds,injury_report` pulls
-data **fresh from upstream**, that data is also archived. Nothing to schedule, and
-anything you look at is recorded by the act of looking at it.
+| Table | Holds | Written by |
+| --- | --- | --- |
+| `seasons`, `managers` | The season chain and who played in each | `/backfill` |
+| `transactions` | Every transaction, every season | `/backfill` |
+| `draft_picks` | Every draft, every season | `/backfill` |
+| `roster_snapshots` | Rosters and standings per week | `/backfill` |
+| `odds_history` | Betting lines as they moved | `/capture`, and reads |
+| `injury_history` | Injury reports as they changed | `/capture`, and reads |
+| `decisions` | Your decision log | `/decision` |
 
-It fires only on an actual upstream fetch, never on a cache hit — archiving a cached
-response would re-scan the archive just to conclude nothing changed. It is also
-strictly best-effort: a failure is logged and swallowed, because a broken archive must
-never turn a working `/odds` call into a `500`.
+Standard-library `sqlite3`, no ORM. WAL mode, so a read never waits behind a write.
+Schema changes are versioned migrations applied at startup (`PRAGMA user_version`), and a
+database written by a newer build is refused rather than downgraded.
 
-The gap this leaves is coverage: a week nobody asks about is a week nobody records.
-Hence the second path.
+Every table also keeps the upstream row verbatim in a `payload` column beside the
+extracted ones. Wanting a field later is then a query change rather than a migration
+*plus* a re-fetch of data that may no longer exist.
 
-Set `HISTORY_AUTO_CAPTURE=false` to turn this off and archive only on `/capture`.
+Sizing, measured rather than guessed: a 12-team league produces around 360 transactions a
+season, so **a decade of complete league history is under 1MB**. Reading all of it and
+computing every manager profile takes about 60ms. Nothing here is close to needing an
+index to be fast; the schema is for structure, not for scale.
 
-### 2. On a schedule, via `POST /capture`
+### `POST /backfill`
 
-Writes the current week's betting lines and injury reports to an append-only
-[JSON Lines](https://jsonlines.org) file, one per source per season, under
-`HISTORY_DIR`. Query params: `week`, `season` (both default to current), `teams`
-(defaults to all 32) and `refresh` (default `true`).
+Walks `previous_league_id` backwards and archives each season it finds. Transactions,
+draft picks and final rosters do not change once a season is over, so they are fetched
+once and never requested again — a re-run **skips finished seasons** and only re-reads
+the one in progress.
 
-Unlike the automatic path this captures **all 32 teams and every game**, whether or not
-anyone asked about them, which is what makes the archive complete rather than a record
-of your browsing.
-
-`refresh=true` bypasses the read caches so the archived line is the one live at capture
-time, rather than whatever a browsing request happened to warm the cache with hours
-earlier. That is the entire point of capturing on a schedule, so it defaults on and
-costs one Odds API call per capture.
-
-### Both together
-
-The two paths share one deduplicated archive, so they never double-write. **A capture
-that would write a row identical to the last recorded state is skipped**, whichever path
-it came from. If browsing already recorded Thursday's line, the Thursday cron writes
-nothing; if nobody browsed, the cron is the only record. Running either more often than
-the lines move costs nothing, and every real change is kept:
-
-```
-08:33:23  DET@KC  spread=-9.0  total=50.0     <- Thursday
-08:41:07  DET@KC  spread=-7.5  total=50.0     <- Sunday, line moved
-
-08:33:23  SF  Christian McCaffrey  practice=did_not_practice   <- Wednesday
-08:41:07  SF  Christian McCaffrey  practice=limited            <- Friday
+```bash
+curl -X POST -H "X-API-Key: $API_KEY" https://your-domain.example/backfill
 ```
 
-The sequence *is* the history: a subject appears again only when something about it
-actually changed.
+Run it once after deploying, then whenever a season ends. `GET /seasons?discover=true`
+shows what it would pick up before you run it.
+
+### Multi-season profiling
+
+Once backfilled, `/managers` reads from the archive across every season:
+
+```bash
+curl -H "X-API-Key: $API_KEY" "https://your-domain.example/managers"
+curl -H "X-API-Key: $API_KEY" "https://your-domain.example/managers?seasons=2025,2026"
+curl -H "X-API-Key: $API_KEY" "https://your-domain.example/managers?days=30"
+```
+
+Omitting both parameters uses everything archived, which is the point. The response says
+which `source` it used — `archive`, or `live (current season only)` when nothing has been
+backfilled yet, so the endpoint still works before the first run.
+
+### Capturing what evaporates
+
+Odds and injury reports are captured two ways, and they cover each other's gaps.
+
+**Automatically, on every read.** Whenever `/odds`, `/injury-report` or a
+`/snapshot?include=` pulls data **fresh from upstream**, it is also archived. It fires
+only on an actual fetch, never on a cache hit — archiving a cached response would query
+the archive just to conclude nothing changed. It is strictly best-effort: a failure is
+logged and swallowed, because a broken archive must never turn a working `/odds` call
+into a `500`. Set `HISTORY_AUTO_CAPTURE=false` to switch it off.
+
+The gap it leaves is coverage: a week nobody asks about is a week nobody records.
+
+**On a schedule, via `POST /capture`.** Captures all 32 teams and every game whether or
+not anyone asked, which is what makes the archive complete rather than a record of your
+browsing. Query params: `week`, `season` (both default to current), `teams` (all 32) and
+`refresh` (default `true`, which bypasses the read caches so the archived line is the one
+live at capture time).
+
+**A row identical to the last recorded state is skipped**, whichever path it came from.
+If browsing already recorded Thursday's line, the Thursday cron writes nothing; if nobody
+browsed, the cron is the only record. The sequence of rows *is* the history:
+
+```
+DET@KC  spread=-9.0     <- Thursday
+DET@KC  spread=-7.5     <- Sunday, the line moved
+
+SF  Christian McCaffrey  practice=did_not_practice   <- Wednesday
+SF  Christian McCaffrey  practice=limited            <- Friday
+```
 
 ### Scheduling it
 
-Point a scheduler at the endpoint — a Railway cron service, or any cron:
-
 ```bash
-# Thursday evening and Sunday shortly before the early kickoffs
 curl -fsS -X POST -H "X-API-Key: $API_KEY" https://your-domain.example/capture
 ```
 
-On Railway, add a third service in the same project with **Settings → Cron Schedule**
-(e.g. `0 23 * * 4` and a second for Sunday), running that curl against the backend's
-private domain. Twice a week for 18 weeks is ~36 Odds API calls a season, against a
-~500/month free allowance. The automatic path adds no calls of its own — it only archives fetches that
-were going to happen anyway. Storage runs roughly **250KB of odds and ~2MB of injuries per season** — the
-same `/data` volume covers it without going near needing a database engine.
+On Railway, add a service in the same project with **Settings → Cron Schedule** (e.g.
+`0 23 * * 4` and another for Sunday) running that against the backend's private domain.
+Twice a week for 18 weeks is ~36 Odds API calls a season against a ~500/month allowance.
+The automatic path adds no calls of its own — it only archives fetches that were going to
+happen anyway.
 
 ### Reading it back
 
 ```bash
 curl -H "X-API-Key: $API_KEY" "https://your-domain.example/history"
 curl -H "X-API-Key: $API_KEY" "https://your-domain.example/history/odds?season=2025&week=2"
-curl -H "X-API-Key: $API_KEY" "https://your-domain.example/history/injuries?season=2025"
+curl -H "X-API-Key: $API_KEY" "https://your-domain.example/history/decisions?season=2025"
 ```
 
+`/history` reports the database's size, schema version and row counts per table.
+
 After a season or two this answers questions no API will: *how do my RBs score when the
-team is favoured by 7+?*, *do players listed limited on Wednesday actually play?*
-
-An interrupted write can leave a torn final line. The reader skips it with a warning
-instead of failing, and the next append starts on a fresh line so the damage stays
-confined to that one row.
-
-Deduplication is decided against an in-memory index of the last state per subject, built
-from the file the first time a week is touched, so auto-capture does not re-read the
-season archive on every request. The app runs single-worker (`--workers 1`); with
-several worker processes those indexes could drift and occasionally write a duplicate
-row, which is harmless but worth knowing before raising the worker count.
+team is favoured by 7+?*, *do players listed limited on Wednesday actually play?*, *has
+this manager ever bid above $12?*
 
 ## Authentication
 
@@ -641,7 +666,7 @@ required).
 | `ESPN_CACHE_TTL_HOURS` | no | `3` | How long injury reports are cached |
 | `WEATHER_CACHE_TTL_HOURS` | no | `12` | Forecast cache during the week |
 | `WEATHER_GAMEDAY_CACHE_TTL_HOURS` | no | `1` | Forecast cache once kickoff is within a day |
-| `HISTORY_DIR` | no | `<CACHE_DIR>/history` | Append-only archive of odds and injury reports |
+| `DATABASE_PATH` | no | `<CACHE_DIR>/league.db` | SQLite file holding the league history |
 | `HISTORY_AUTO_CAPTURE` | no | `true` | Also archive what read endpoints pull fresh, not just `/capture` |
 | `SLEEPER_BASE_URL` | no | `https://api.sleeper.app/v1` | Sleeper API base URL |
 | `HTTP_TIMEOUT` | no | `20` | Per-request timeout (seconds) for Sleeper calls |
@@ -711,13 +736,20 @@ builder and the healthcheck path.
    - `API_KEY` — `openssl rand -hex 32`
    - `PLAYERS_CACHE_PATH` = `/data/players_cache.json`
    - `CACHE_DIR` = `/data`
-   - `HISTORY_DIR` = `/data/history`
+   - `DATABASE_PATH` = `/data/league.db`
    - `ODDS_API_KEY` — optional
-5. **Volume**: attach one mounted at `/data`. Without it the ~5MB player file and the
-   ~5MB nflverse aggregate are rebuilt on every deploy, and the append-only archive is
-   **lost entirely** — that one cannot be re-fetched.
+5. **Volume**: attach one mounted at `/data`. This is not optional. Without it the ~5MB
+   player file and the ~5MB nflverse aggregate are rebuilt on every deploy — annoying but
+   recoverable — and `league.db` is **destroyed on every deploy**. The transactions and
+   draft picks in it can be re-fetched with `/backfill`, but the archived betting lines
+   and injury reports cannot be re-fetched from anywhere.
 6. **Networking**: generate a domain, or a public one only if you want to call the API
    directly. The MCP server can reach it privately without one.
+7. **After the first deploy**, run the backfill once so manager profiling can see past
+   seasons:
+   ```bash
+   curl -X POST -H "X-API-Key: $API_KEY" https://api.tudominio.com/backfill
+   ```
 
 ### 2. The MCP service
 
@@ -768,6 +800,10 @@ just does not use those files.
 Being straight about this, because two of these sources could not be reached from the
 machine this was built on:
 
+- **Verified offline, end to end.** The SQLite layer: migrations, the season-chain walk,
+  multi-season profiling, and that a re-run of `/backfill` skips finished seasons (54
+  Sleeper calls on the first run, 18 on the second). Driven against a three-season fake
+  league, since Sleeper itself is unreachable from the build environment.
 - **Verified against the live service.** nflverse: the column names, the `gsis_id` /
   `pfr_id` join, the red zone aggregation, the season fallback, and the draft board
   (2026 class: 80 skill picks, all with `gsis_id`, 70 matched to combine data) were all
@@ -843,7 +879,10 @@ app/pressure.py         Structural gaps: bye collisions, injuries, no cover
 app/schedule.py         Bye weeks derived from the nflverse schedule
 app/teams.py            Static stadium coordinates, roof types, name aliases
 app/enrichment.py       The optional ?include= blocks on /snapshot
-app/history.py          Append-only JSONL archive + the /capture flow
+app/db.py               SQLite connection, schema and versioned migrations
+app/store.py            Typed reads and writes over the database
+app/backfill.py         Walks previous_league_id and archives each season
+app/history.py          Capture logic for odds and injury reports
 tests/                  Offline tests against fixture payloads
 mcp_server/             MCP server exposing this API to Claude.ai (own README)
 Dockerfile              Multi-stage build, non-root, healthcheck

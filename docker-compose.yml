@@ -22,8 +22,8 @@ services:
       NFLVERSE_INCLUDE_RED_ZONE: ${NFLVERSE_INCLUDE_RED_ZONE:-true}
       ESPN_CACHE_TTL_HOURS: ${ESPN_CACHE_TTL_HOURS:-3}
       WEATHER_CACHE_TTL_HOURS: ${WEATHER_CACHE_TTL_HOURS:-12}
-      # Append-only archive of odds and injury reports (see /capture).
-      HISTORY_DIR: /data/history
+      # SQLite database with the league history (see /backfill and /capture).
+      DATABASE_PATH: /data/league.db
       HISTORY_AUTO_CAPTURE: ${HISTORY_AUTO_CAPTURE:-true}
       HTTP_TIMEOUT: ${HTTP_TIMEOUT:-20}
       PLAYERS_HTTP_TIMEOUT: ${PLAYERS_HTTP_TIMEOUT:-120}

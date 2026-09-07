@@ -15,7 +15,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from app.history import auto_capture, injury_rows, odds_rows
+from app.history import auto_capture, injury_rows, odds_rows  # noqa: F401
 from app.players import PlayerStore
 from app.teams import normalise_abbr
 

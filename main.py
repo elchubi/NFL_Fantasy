@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -19,16 +20,16 @@ from app import __version__, enrichment, services
 from app.config import get_settings
 from app.draft import DraftProvider, landing_spot, require_prospect
 from app.espn import EspnProvider
+from app.backfill import backfill_all, discover_chain
+from app.db import Database
 from app.history import SOURCES as HISTORY_SOURCES
 from app.history import (
-    HistoryStore,
-    apply_outcome,
     auto_capture,
     capture_week,
     decision_row,
     injury_rows,
     odds_rows,
-    pair_decisions,
+    outcome_row,
 )
 from app.managers import build_profiles
 from app.http import build_client
@@ -38,6 +39,7 @@ from app.players import PlayerStore
 from app.pressure import analyse_league
 from app.schedule import ScheduleProvider
 from app.security import require_api_key
+from app import store
 from app.sleeper import SleeperClient
 from app.teams import STADIUMS, normalise_abbr
 from app.weather import WeatherProvider, all_stadiums
@@ -62,9 +64,10 @@ weather = WeatherProvider(external_http)
 draft = DraftProvider(external_http)
 schedule = ScheduleProvider(external_http)
 
-# Append-only archive for betting lines and injury reports - the only two
-# sources that cannot be re-fetched from upstream once the week has passed.
-history = HistoryStore(settings.history_path())
+# The league's own history: transactions and draft picks across every season in
+# the chain, plus the betting lines and injury reports that cannot be re-fetched
+# once the week has passed.
+db = Database(settings.database_file())
 
 # Sources that keep a disk cache (warmed at startup).
 CACHED_PROVIDERS = {
@@ -80,7 +83,7 @@ CACHED_PROVIDERS = {
 # can archive whatever they pull fresh, the same as the read endpoints do.
 PROVIDERS = {
     **CACHED_PROVIDERS,
-    "history": history if settings.history_auto_capture else None,
+    "history": db if settings.history_auto_capture else None,
 }
 
 
@@ -95,11 +98,14 @@ async def lifespan(app: FastAPI):
     players.load_from_disk()
     for provider in CACHED_PROVIDERS.values():
         provider.cache.load()
+    # Opens the file and applies any pending migrations.
+    log.info("Database ready: %s", db.stats())
     if not settings.odds_api_key:
         log.info("ODDS_API_KEY is not set; /odds will return 503 until it is.")
     yield
     await client.aclose()
     await external_http.aclose()
+    db.close()
 
 
 app = FastAPI(
@@ -322,7 +328,7 @@ async def odds_for_week(
     payload = await odds.for_week(week, target_season)
     if settings.history_auto_capture and (payload.get("cache") or {}).get("refreshed"):
         # Fresh from upstream, so this is a line state worth keeping.
-        await auto_capture(history, "odds", target_season, week, odds_rows(payload["games"]))
+        await auto_capture(db, "odds", target_season, week, odds_rows(payload["games"]))
     return payload
 
 
@@ -443,11 +449,21 @@ async def stadiums() -> dict[str, Any]:
     summary="Behavioural profile of every manager in the league",
 )
 async def managers(
-    days: int = Query(
-        default=180,
+    seasons: str | None = Query(
+        default=None,
+        description=(
+            "Comma-separated seasons to profile, e.g. 2025,2026. Defaults to every "
+            "season archived by /backfill, falling back to the current one."
+        ),
+    ),
+    days: int | None = Query(
+        default=None,
         ge=1,
-        le=400,
-        description="How far back to read transactions.",
+        le=4000,
+        description=(
+            "Only count transactions from the last N days. Omit to use every "
+            "archived transaction, which is what makes a multi-season profile."
+        ),
     ),
 ) -> dict[str, Any]:
     """FAAB habits, bid timing, activity, draft tendencies and trade history.
@@ -455,30 +471,50 @@ async def managers(
     Derived from your league's own Sleeper history. This is the one thing a
     general fantasy tool cannot do for you: it has no idea who else is in your
     league.
+
+    Reads from the archive, which spans every season `/backfill` has walked -
+    each Sleeper season is a separate league, so this is the only way to see
+    past ones. Falls back to reading the current season live if nothing is
+    archived yet.
     """
     await players.ensure_fresh()
     lid = league_id()
-    state, league, users, rosters, drafts = await asyncio.gather(
-        client.nfl_state(),
-        client.league(lid),
-        client.users(lid),
-        client.rosters(lid),
-        client.drafts(lid),
+
+    requested = _parse_seasons(seasons)
+    archived = await store.known_season_numbers(db)
+    target_seasons = requested or archived
+
+    league, users, rosters = await asyncio.gather(
+        client.league(lid), client.users(lid), client.rosters(lid)
     )
 
-    nfl_week = services.current_week(state)
-    weeks = services._weeks_to_scan(nfl_week, days)
-    tx_pages = await asyncio.gather(*[client.transactions(lid, w) for w in weeks])
-    transactions = [tx for page in tx_pages for tx in page]
+    since_ms = (time.time() - days * 86400) * 1000 if days else None
+    transactions = (
+        await store.load_transactions(db, seasons=target_seasons, since_ms=since_ms)
+        if target_seasons
+        else []
+    )
+    picks = await store.load_draft_picks(db, target_seasons) if target_seasons else []
+    source = "archive"
 
-    picks: list[dict[str, Any]] = []
-    if drafts:
-        newest = max(drafts, key=lambda d: str(d.get("season") or ""))
-        if newest.get("draft_id"):
-            picks = await client.draft_picks(newest["draft_id"])
+    if not transactions:
+        # Nothing archived yet: read the current season live so the endpoint is
+        # useful before the first backfill.
+        source = "live (current season only)"
+        state = await client.nfl_state()
+        weeks = services._weeks_to_scan(services.current_week(state), days or 180)
+        pages = await asyncio.gather(*[client.transactions(lid, w) for w in weeks])
+        transactions = [tx for page in pages for tx in page]
+        drafts = await client.drafts(lid)
+        if drafts:
+            newest = max(drafts, key=lambda d: str(d.get("season") or ""))
+            if newest.get("draft_id"):
+                picks = await client.draft_picks(newest["draft_id"])
+        target_seasons = [int(league["season"])] if league.get("season") else []
 
-    season = services._season_number(state, league)
-    injury_history = history.read("injuries", season, limit=5000) if season else []
+    injury_history: list[dict[str, Any]] = []
+    for season in target_seasons:
+        injury_history.extend(await store.read_injuries(db, season))
 
     profiles = build_profiles(
         services.build_teams(users, rosters),
@@ -490,12 +526,32 @@ async def managers(
     )
     return {
         "league_id": lid,
-        "weeks_scanned": weeks,
+        "source": source,
+        "seasons": sorted(target_seasons, reverse=True),
+        "seasons_archived": archived,
+        "days_filter": days,
         "transactions_read": len(transactions),
         "draft_picks_read": len(picks),
         "injury_history_rows": len(injury_history),
         **profiles,
     }
+
+
+def _parse_seasons(raw: str | None) -> list[int]:
+    if not raw:
+        return []
+    out: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail=f"'{part}' is not a season year."
+            ) from None
+    return out
 
 
 @app.get(
@@ -506,10 +562,11 @@ async def managers(
 )
 async def manager(
     name: str = Path(description="Username, display name or team name."),
-    days: int = Query(default=180, ge=1, le=400),
+    seasons: str | None = Query(default=None),
+    days: int | None = Query(default=None, ge=1, le=4000),
 ) -> dict[str, Any]:
     """One manager's profile, read against the rest of the league."""
-    everyone = await managers(days=days)
+    everyone = await managers(seasons=seasons, days=days)
     needle = " ".join(name.strip().lower().split())
 
     match = next(
@@ -536,7 +593,12 @@ async def manager(
                 ],
             },
         )
-    return {"manager": match, "league_context": everyone["league_context"]}
+    return {
+        "manager": match,
+        "league_context": everyone["league_context"],
+        "seasons": everyone["seasons"],
+        "source": everyone["source"],
+    }
 
 
 @app.get(
@@ -613,7 +675,7 @@ async def log_decision(
         confidence=confidence,
         expected=expected,
     )
-    result = await history.append("decisions", target_season, target_week, [row])
+    result = await store.append_decision(db, target_season, target_week, row)
     return {"logged": result.get("written", 0) == 1, "decision": row, "archive": result}
 
 
@@ -630,16 +692,14 @@ async def log_outcome(
 ) -> dict[str, Any]:
     """Append the outcome. The original call is never edited, only layered on."""
     target_season = season or await current_season()
-    rows = history.read("decisions", target_season)
-    follow_up = apply_outcome(rows, decision_id, outcome)
-    if follow_up is None:
+    original = await store.find_decision(db, target_season, decision_id)
+    if original is None:
         raise HTTPException(
             status_code=404,
             detail=f"No decision '{decision_id}' logged in {target_season}.",
         )
-    result = await history.append(
-        "decisions", target_season, follow_up.get("week") or 1, [follow_up]
-    )
+    follow_up = outcome_row(original, outcome)
+    result = await store.append_decision(db, target_season, original.get("week"), follow_up)
     return {"recorded": True, "decision": follow_up, "archive": result}
 
 
@@ -659,7 +719,7 @@ async def decisions(
 ) -> dict[str, Any]:
     """Your decisions with their outcomes, oldest first."""
     target_season = season or await current_season()
-    rows = pair_decisions(history.read("decisions", target_season, week=week))
+    rows = await store.read_decisions(db, target_season, week=week)
     if kind:
         rows = [r for r in rows if r.get("kind") == kind]
     if pending_only:
@@ -800,6 +860,72 @@ def _with_sleeper(prospect: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.post(
+    "/backfill",
+    tags=["history"],
+    dependencies=[Depends(require_api_key)],
+    summary="Archive every season of the league",
+)
+async def backfill(
+    refresh: bool = Query(
+        default=False,
+        description=(
+            "Re-read seasons already archived. A finished season cannot change, "
+            "so this is only useful after a bug fix."
+        ),
+    ),
+    limit: int = Query(
+        default=20, ge=1, le=20, description="How many seasons back to walk."
+    ),
+) -> dict[str, Any]:
+    """Walk `previous_league_id` and archive each season's history.
+
+    In Sleeper every season is a separate league, so a single LEAGUE_ID only
+    ever reaches the current one. This follows the chain backwards and stores
+    transactions, draft picks, managers and final rosters for each season it
+    finds. Run it once after deploying, then whenever a season ends.
+
+    Finished seasons are skipped on a re-run since they cannot change; the
+    season in progress is always re-read.
+    """
+    return await backfill_all(client, db, league_id(), refresh=refresh, limit=limit)
+
+
+@app.get(
+    "/seasons",
+    tags=["history"],
+    dependencies=[Depends(require_api_key)],
+    summary="The league's season chain",
+)
+async def seasons_endpoint(
+    discover: bool = Query(
+        default=False,
+        description="Follow previous_league_id live instead of reading the archive.",
+    ),
+) -> dict[str, Any]:
+    """Every season of this league, newest first.
+
+    Reads the archive by default. `discover=true` walks the chain against
+    Sleeper, which is how to see what a backfill would pick up before running it.
+    """
+    if discover:
+        chain = await discover_chain(client, league_id())
+        return {
+            "source": "sleeper",
+            "seasons": [
+                {
+                    "season": league.get("season"),
+                    "league_id": league.get("league_id"),
+                    "name": league.get("name"),
+                    "status": league.get("status"),
+                    "previous_league_id": league.get("previous_league_id"),
+                }
+                for league in chain
+            ],
+        }
+    return {"source": "archive", "seasons": await store.seasons(db)}
+
+
+@app.post(
     "/capture",
     tags=["history"],
     dependencies=[Depends(require_api_key)],
@@ -848,7 +974,7 @@ async def capture(
         team_list = sorted(STADIUMS)
 
     return await capture_week(
-        history,
+        db,
         odds_provider=odds,
         espn_provider=espn,
         season=target_season,
@@ -867,12 +993,13 @@ async def capture(
 async def history_inventory() -> dict[str, Any]:
     """Rows, weeks and file sizes per source and season."""
     return {
-        "directory": settings.history_path(),
-        "sources": list(HISTORY_SOURCES),
-        "archived": history.inventory(),
+        "database": db.stats(),
+        "archived": await store.inventory(db),
+        "seasons": await store.seasons(db),
         "note": (
-            "Only odds and injury reports are archived. nflverse, Sleeper and "
-            "Open-Meteo keep their own history upstream and are re-fetched on demand."
+            "Transactions, draft picks and roster snapshots come from /backfill. "
+            "Odds and injuries are captured because they cannot be re-fetched. "
+            "nflverse and Open-Meteo keep their own history upstream."
         ),
     }
 
@@ -903,7 +1030,13 @@ async def history_rows(
             detail=f"Unknown history source '{source}'. Valid: {', '.join(HISTORY_SOURCES)}.",
         )
     target_season = season or await current_season()
-    rows = history.read(source, target_season, week=week, limit=limit)
+    if source == "odds":
+        rows = await store.read_odds(db, target_season, week=week, limit=limit)
+    elif source == "injuries":
+        rows = await store.read_injuries(db, target_season, week=week, limit=limit)
+    else:
+        rows = await store.read_decisions(db, target_season, week=week)
+        rows = rows[-limit:] if limit else rows
     return {
         "source": source,
         "season": target_season,
@@ -924,7 +1057,7 @@ async def _archive_injuries(report: dict[str, Any]) -> None:
     if not team or not injuries:
         return
     season, week = await _current_season_week()
-    await auto_capture(history, "injuries", season, week, injury_rows(team, injuries))
+    await auto_capture(db, "injuries", season, week, injury_rows(team, injuries))
 
 
 # The season and week only change once a week, so one Sleeper call an hour is

@@ -286,12 +286,15 @@ async def stats_stadiums() -> Any:
         "has never bid above $12 is worth more than any projection."
     ),
 )
-async def manager_list(days: int = 180) -> Any:
+async def manager_list(seasons: str | None = None, days: int | None = None) -> Any:
     """
     Args:
-        days: How far back to read transactions (1-400).
+        seasons: Comma-separated seasons, e.g. "2025,2026". Defaults to every
+            season archived by history_backfill.
+        days: Only count transactions from the last N days. Omit to use the
+            whole archive, which is what makes the profile multi-season.
     """
-    return await _get("/managers", params={"days": days})
+    return await _get("/managers", params={"seasons": seasons, "days": days})
 
 
 @mcp.tool(
@@ -302,13 +305,16 @@ async def manager_list(days: int = 180) -> Any:
         "dealing with a specific opponent rather than surveying everyone."
     ),
 )
-async def manager_profile(name: str, days: int = 180) -> Any:
+async def manager_profile(
+    name: str, seasons: str | None = None, days: int | None = None
+) -> Any:
     """
     Args:
         name: Username, display name or team name.
-        days: How far back to read transactions (1-400).
+        seasons: Comma-separated seasons. Defaults to everything archived.
+        days: Only count transactions from the last N days.
     """
-    return await _get(f"/manager/{name}", params={"days": days})
+    return await _get(f"/manager/{name}", params={"seasons": seasons, "days": days})
 
 
 @mcp.tool(
@@ -515,6 +521,46 @@ async def history_capture(
 
 
 @mcp.tool(
+    name="history_backfill",
+    annotations=IDEMPOTENT_WRITE,
+    description=(
+        "Walk the league's season chain and archive every season's transactions, "
+        "draft picks and managers. In Sleeper each season is a separate league, so "
+        "this is the only way to reach past ones - manager profiling is limited to "
+        "the current season until this has run. Safe to repeat: finished seasons "
+        "are skipped, only the season in progress is re-read. Run it once after "
+        "deploying and again when a season ends."
+    ),
+)
+async def history_backfill(refresh: bool = False, limit: int = 20) -> Any:
+    """
+    Args:
+        refresh: Re-read seasons already archived. A finished season cannot
+            change, so this is only useful after a bug fix.
+        limit: How many seasons back to walk.
+    """
+    return await _post("/backfill", params={"refresh": refresh, "limit": limit})
+
+
+@mcp.tool(
+    name="history_seasons",
+    annotations=READ_ONLY,
+    description=(
+        "The league's seasons, newest first. Use it to see which seasons are "
+        "available to profile over, or with discover=true to check what a backfill "
+        "would pick up before running one."
+    ),
+)
+async def history_seasons(discover: bool = False) -> Any:
+    """
+    Args:
+        discover: Follow previous_league_id against Sleeper instead of reading
+            what is already archived.
+    """
+    return await _get("/seasons", params={"discover": discover})
+
+
+@mcp.tool(
     name="history_inventory",
     annotations=READ_ONLY,
     description=(
@@ -594,6 +640,7 @@ TOOL_NAMES = [
     "manager_list", "manager_profile", "manager_pressure",
     "decision_log", "decision_log_outcome", "decision_list",
     "draft_class", "draft_prospect",
+    "history_backfill", "history_seasons",
     "history_capture", "history_inventory", "history_source",
     "health_check",
 ]

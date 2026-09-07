@@ -122,7 +122,7 @@ public URL instead — it works, it just sends the traffic out and back.
 
 ## The tools
 
-21 tools, one per backend endpoint. `/docs` is not exposed — it is only the OpenAPI
+23 tools, one per backend endpoint. `/docs` is not exposed — it is only the OpenAPI
 reference and nothing useful to a model.
 
 ### League
@@ -148,7 +148,7 @@ reference and nothing useful to a model.
 
 | Tool | What it does |
 | --- | --- |
-| `manager_list` | Every manager's FAAB habits, activity, draft tendencies and trade history. |
+| `manager_list` | Every manager's FAAB habits, activity, draft tendencies and trade history, across every archived season. |
 | `manager_profile` | One manager, read against the field. |
 | `manager_pressure` | Which teams are forced to act — bye collisions, stacked injuries, no cover. |
 | `decision_log` | Record a decision and its reasoning. Append-only. |
@@ -166,6 +166,8 @@ reference and nothing useful to a model.
 
 | Tool | What it does |
 | --- | --- |
+| `history_backfill` | Walk the season chain and archive every season's transactions and drafts. Run once after deploying. Safe to repeat. |
+| `history_seasons` | The league's seasons, or what a backfill would pick up. |
 | `history_capture` | Archive the week's lines and injury reports. Safe to repeat. |
 | `history_inventory` | What the archive holds, per source and season. |
 | `history_source` | Read archived rows for `odds`, `injuries` or `decisions`. |
@@ -179,9 +181,10 @@ Every tool declares what it does to state, so any MCP client can tell them apart
 - **`decision_log` and `decision_log_outcome`** are `readOnlyHint: false` with
   `destructiveHint: false` — they only ever append a row, and can never edit or delete
   one. An outcome is layered on top of the original entry rather than replacing it.
-- **`history_capture`** is `readOnlyHint: false` with `idempotentHint: true` — the
-  backend skips rows identical to the last recorded state, so calling it twice in a row
-  records nothing the second time.
+- **`history_capture` and `history_backfill`** are `readOnlyHint: false` with
+  `idempotentHint: true` — capture skips rows identical to the last recorded state, and
+  backfill skips seasons already archived, so calling either twice in a row records
+  nothing the second time.
 
 ## How errors reach the model
 

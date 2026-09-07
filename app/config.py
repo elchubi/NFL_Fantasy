@@ -42,9 +42,10 @@ class Settings(BaseSettings):
     espn_base_url: str = "https://site.api.espn.com/apis/site/v2/sports/football/nfl"
     espn_cache_ttl_hours: float = 3.0
 
-    # Append-only archive for the sources that cannot be re-fetched later.
-    # Empty means "history/ under the cache directory".
-    history_dir: str = ""
+    # SQLite database holding the league's own history: transactions, draft
+    # picks, roster snapshots, betting lines, injury reports and decisions.
+    # Empty means "league.db under the cache directory".
+    database_path: str = ""
     # Archive whatever a read endpoint pulls fresh from upstream, on top of the
     # scheduled /capture. Set false to archive only on /capture.
     history_auto_capture: bool = True
@@ -75,14 +76,14 @@ class Settings(BaseSettings):
         base = Path(self.cache_dir) if self.cache_dir else Path(self.players_cache_path).parent
         return str(base / filename)
 
-    def history_path(self) -> str:
-        """Directory holding the append-only JSONL archive."""
+    def database_file(self) -> str:
+        """Path to the SQLite database."""
         from pathlib import Path
 
-        if self.history_dir:
-            return self.history_dir
+        if self.database_path:
+            return self.database_path
         base = Path(self.cache_dir) if self.cache_dir else Path(self.players_cache_path).parent
-        return str(base / "history")
+        return str(base / "league.db")
 
 
 @lru_cache
