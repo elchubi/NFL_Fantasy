@@ -20,11 +20,23 @@ from app.config import get_settings
 from app.draft import DraftProvider, landing_spot, require_prospect
 from app.espn import EspnProvider
 from app.history import SOURCES as HISTORY_SOURCES
-from app.history import HistoryStore, auto_capture, capture_week, injury_rows, odds_rows
+from app.history import (
+    HistoryStore,
+    apply_outcome,
+    auto_capture,
+    capture_week,
+    decision_row,
+    injury_rows,
+    odds_rows,
+    pair_decisions,
+)
+from app.managers import build_profiles
 from app.http import build_client
 from app.nflverse import NflverseProvider, require_gsis
 from app.odds import OddsProvider
 from app.players import PlayerStore
+from app.pressure import analyse_league
+from app.schedule import ScheduleProvider
 from app.security import require_api_key
 from app.sleeper import SleeperClient
 from app.teams import STADIUMS, normalise_abbr
@@ -48,6 +60,7 @@ odds = OddsProvider(external_http)
 espn = EspnProvider(external_http)
 weather = WeatherProvider(external_http)
 draft = DraftProvider(external_http)
+schedule = ScheduleProvider(external_http)
 
 # Append-only archive for betting lines and injury reports - the only two
 # sources that cannot be re-fetched from upstream once the week has passed.
@@ -60,6 +73,7 @@ CACHED_PROVIDERS = {
     "espn": espn,
     "weather": weather,
     "draft": draft,
+    "schedule": schedule,
 }
 
 # What the /snapshot blocks get. The history store rides along so those blocks
@@ -420,6 +434,245 @@ async def weather_for_week(
 async def stadiums() -> dict[str, Any]:
     """Coordinates and roof type per team - useful for checking the dome list."""
     return {"count": len(STADIUMS), "stadiums": all_stadiums()}
+
+
+@app.get(
+    "/managers",
+    tags=["edge"],
+    dependencies=[Depends(require_api_key)],
+    summary="Behavioural profile of every manager in the league",
+)
+async def managers(
+    days: int = Query(
+        default=180,
+        ge=1,
+        le=400,
+        description="How far back to read transactions.",
+    ),
+) -> dict[str, Any]:
+    """FAAB habits, bid timing, activity, draft tendencies and trade history.
+
+    Derived from your league's own Sleeper history. This is the one thing a
+    general fantasy tool cannot do for you: it has no idea who else is in your
+    league.
+    """
+    await players.ensure_fresh()
+    lid = league_id()
+    state, league, users, rosters, drafts = await asyncio.gather(
+        client.nfl_state(),
+        client.league(lid),
+        client.users(lid),
+        client.rosters(lid),
+        client.drafts(lid),
+    )
+
+    nfl_week = services.current_week(state)
+    weeks = services._weeks_to_scan(nfl_week, days)
+    tx_pages = await asyncio.gather(*[client.transactions(lid, w) for w in weeks])
+    transactions = [tx for page in tx_pages for tx in page]
+
+    picks: list[dict[str, Any]] = []
+    if drafts:
+        newest = max(drafts, key=lambda d: str(d.get("season") or ""))
+        if newest.get("draft_id"):
+            picks = await client.draft_picks(newest["draft_id"])
+
+    season = services._season_number(state, league)
+    injury_history = history.read("injuries", season, limit=5000) if season else []
+
+    profiles = build_profiles(
+        services.build_teams(users, rosters),
+        transactions,
+        picks,
+        players,
+        waiver_budget=(league.get("settings") or {}).get("waiver_budget"),
+        injury_history=injury_history,
+    )
+    return {
+        "league_id": lid,
+        "weeks_scanned": weeks,
+        "transactions_read": len(transactions),
+        "draft_picks_read": len(picks),
+        "injury_history_rows": len(injury_history),
+        **profiles,
+    }
+
+
+@app.get(
+    "/manager/{name}",
+    tags=["edge"],
+    dependencies=[Depends(require_api_key)],
+    summary="Behavioural profile of one manager",
+)
+async def manager(
+    name: str = Path(description="Username, display name or team name."),
+    days: int = Query(default=180, ge=1, le=400),
+) -> dict[str, Any]:
+    """One manager's profile, read against the rest of the league."""
+    everyone = await managers(days=days)
+    needle = " ".join(name.strip().lower().split())
+
+    match = next(
+        (
+            profile
+            for profile in everyone["managers"]
+            if needle
+            in " ".join(
+                str(v).lower()
+                for v in (profile.get("display_name"), profile.get("team_name"))
+                if v
+            )
+        ),
+        None,
+    )
+    if match is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"No manager matches '{name}'.",
+                "available": [
+                    {"display_name": p["display_name"], "team_name": p["team_name"]}
+                    for p in everyone["managers"]
+                ],
+            },
+        )
+    return {"manager": match, "league_context": everyone["league_context"]}
+
+
+@app.get(
+    "/pressure",
+    tags=["edge"],
+    dependencies=[Depends(require_api_key)],
+    summary="Which teams are structurally forced to act",
+)
+async def pressure(
+    week: int | None = Query(default=None, ge=1, le=22),
+    horizon: int = Query(
+        default=3, ge=1, le=6, description="How many weeks ahead to look."
+    ),
+) -> dict[str, Any]:
+    """Bye-week collisions, stacked injuries and positions with no cover.
+
+    A team that has to move before you do is a team you have leverage over.
+    """
+    await players.ensure_fresh()
+    lid = league_id()
+    state, league, users, rosters = await asyncio.gather(
+        client.nfl_state(), client.league(lid), client.users(lid), client.rosters(lid)
+    )
+
+    target_week = week or services.current_week(state)
+    season = services._season_number(state, league)
+    roster_positions = league.get("roster_positions") or []
+    teams = services.build_teams(users, rosters)
+
+    byes = await schedule.byes(season) if season else {}
+    resolved = [
+        services.resolve_roster(r, teams.get(r.get("roster_id"), {}), roster_positions, players)
+        for r in rosters
+    ]
+
+    report = analyse_league(resolved, roster_positions, byes, target_week, horizon=horizon)
+    return {
+        "season": season,
+        "bye_weeks_known": bool(byes),
+        **report,
+    }
+
+
+@app.post(
+    "/decision",
+    tags=["edge"],
+    dependencies=[Depends(require_api_key)],
+    summary="Log a decision you made, and why",
+)
+async def log_decision(
+    kind: str = Query(description="waiver_bid, trade, start_sit, draft_pick, keeper, drop, other."),
+    summary: str = Query(description="What you decided, in one line."),
+    reasoning: str | None = Query(default=None, description="Why you decided it."),
+    players_involved: str | None = Query(
+        default=None, description="Comma-separated player names."
+    ),
+    confidence: str | None = Query(default=None, description="e.g. low / medium / high."),
+    expected: str | None = Query(default=None, description="What you expect to happen."),
+    week: int | None = Query(default=None, ge=1, le=22),
+    season: int | None = Query(default=None, ge=1999, le=2100),
+) -> dict[str, Any]:
+    """Append a decision to the log.
+
+    Recorded at the moment you make it, before you know how it turned out -
+    which is the only version worth having later.
+    """
+    target_season = season or await current_season()
+    target_week = week or await current_week_number()
+    row = decision_row(
+        kind=kind,
+        summary=summary,
+        reasoning=reasoning,
+        players=[p.strip() for p in (players_involved or "").split(",") if p.strip()],
+        confidence=confidence,
+        expected=expected,
+    )
+    result = await history.append("decisions", target_season, target_week, [row])
+    return {"logged": result.get("written", 0) == 1, "decision": row, "archive": result}
+
+
+@app.post(
+    "/decision/{decision_id}/outcome",
+    tags=["edge"],
+    dependencies=[Depends(require_api_key)],
+    summary="Record how a logged decision turned out",
+)
+async def log_outcome(
+    decision_id: str = Path(description="The decision_id returned by POST /decision."),
+    outcome: str = Query(description="What actually happened."),
+    season: int | None = Query(default=None, ge=1999, le=2100),
+) -> dict[str, Any]:
+    """Append the outcome. The original call is never edited, only layered on."""
+    target_season = season or await current_season()
+    rows = history.read("decisions", target_season)
+    follow_up = apply_outcome(rows, decision_id, outcome)
+    if follow_up is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No decision '{decision_id}' logged in {target_season}.",
+        )
+    result = await history.append(
+        "decisions", target_season, follow_up.get("week") or 1, [follow_up]
+    )
+    return {"recorded": True, "decision": follow_up, "archive": result}
+
+
+@app.get(
+    "/decisions",
+    tags=["edge"],
+    dependencies=[Depends(require_api_key)],
+    summary="Read the decision log",
+)
+async def decisions(
+    season: int | None = Query(default=None, ge=1999, le=2100),
+    week: int | None = Query(default=None, ge=1, le=22),
+    kind: str | None = Query(default=None, description="Filter by decision kind."),
+    pending_only: bool = Query(
+        default=False, description="Only decisions with no outcome recorded yet."
+    ),
+) -> dict[str, Any]:
+    """Your decisions with their outcomes, oldest first."""
+    target_season = season or await current_season()
+    rows = pair_decisions(history.read("decisions", target_season, week=week))
+    if kind:
+        rows = [r for r in rows if r.get("kind") == kind]
+    if pending_only:
+        rows = [r for r in rows if not r.get("outcome")]
+
+    resolved = [r for r in rows if r.get("outcome")]
+    return {
+        "season": target_season,
+        "count": len(rows),
+        "with_outcome": len(resolved),
+        "awaiting_outcome": len(rows) - len(resolved),
+        "decisions": rows,
+    }
 
 
 @app.get(

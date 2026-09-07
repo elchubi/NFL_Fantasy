@@ -29,9 +29,15 @@ player file on disk.
 | `GET` | `/stadiums` | `X-API-Key` | The static stadium/dome reference used for weather |
 | `GET` | `/draft-class/{season}` | `X-API-Key` | Rookie draft board: capital, age, combine, landing spot |
 | `GET` | `/prospect/{player_id}` | `X-API-Key` | Draft profile for one player |
+| `GET` | `/managers` | `X-API-Key` | Behavioural profile of every manager in the league |
+| `GET` | `/manager/{name}` | `X-API-Key` | One manager, read against the field |
+| `GET` | `/pressure` | `X-API-Key` | Which teams are structurally forced to act |
+| `POST` | `/decision` | `X-API-Key` | Log a decision and the reasoning behind it |
+| `POST` | `/decision/{id}/outcome` | `X-API-Key` | Record how a logged decision turned out |
+| `GET` | `/decisions` | `X-API-Key` | Read the decision log |
 | `POST` | `/capture` | `X-API-Key` | Archive this week's betting lines and injury reports |
 | `GET` | `/history` | `X-API-Key` | What is in the archive, per source and season |
-| `GET` | `/history/{source}` | `X-API-Key` | Read archived rows (`odds` or `injuries`) |
+| `GET` | `/history/{source}` | `X-API-Key` | Read archived rows (`odds`, `injuries`, `decisions`) |
 | `GET` | `/docs` | none (schema only) | Interactive OpenAPI docs |
 
 ### `GET /snapshot`
@@ -363,6 +369,103 @@ The catch: nflverse's `cfb_player_id` is a College Football Reference slug
 (`jeremiyah-love-1`), **not** a CFBD id, so the join is name + school + year rather than
 a key lookup. Expect a handful of prospects a year to need checking by hand.
 
+## Where the actual edge is
+
+Everyone in the league can ask an AI about players. Stats, projections and rankings are
+table stakes — public, aggregated, and available to all twelve of you. An edge has to
+come from something the others structurally cannot get.
+
+Three things qualify, and all three are built here.
+
+**Be honest about the size of it.** Fantasy football is dominated by variance and draft
+luck. None of this wins you the league. What it does is tilt marginal decisions — how
+much to bid, who to approach for a trade, who to sit in a close call — and those compound
+over a season. The asymmetry is in the cost: an afternoon of work over data you already
+pull, against opponents who will never do this.
+
+### `GET /managers` and `/manager/{name}` — your opponents' habits
+
+A general fantasy tool has no idea who else is in your league. You play the same eleven
+people for years, their habits sit in Sleeper's transaction and draft history, and they
+almost certainly have never looked.
+
+Per manager:
+
+| What | Why it matters |
+| --- | --- |
+| **FAAB behaviour** — typical bid, max ever, win rate on contested claims, share of budget | Somebody who has never bid above $12 loses to $13, not $40 |
+| **Bid timing** — which day they move | Whether they claim early or wait for the deadline |
+| **Injury reaction** — median days from injury report to drop | That gap is your buy-low window |
+| **Activity** — moves, drops, failed claims | A manager who barely touches waivers is free talent and the natural trade target |
+| **Draft tendencies** — first position taken, average round per position | Predicts what disappears before your next pick |
+| **Trade partners** — who they have actually traded with | Who answers, and who never does |
+
+`league_context` puts one manager against the field: the league's median max bid, and who
+the least and most active managers are.
+
+Injury reaction needs the archived injury history to exist — it matches drops against
+when a player first appeared on the injury report. Until the archive has some weeks in
+it, that one field says so rather than reporting a misleading zero.
+
+### `GET /pressure` — who has to move before you do
+
+A manager whose only two startable running backs share a bye week has to act, whether he
+has worked that out yet or not. Knowing before he does changes what you can ask for.
+
+For each team, over the next few weeks (`?horizon=`, default 3), it tries to actually
+fill the lineup from healthy, non-bye players and reports what it cannot fill:
+
+```json
+{
+  "team_name": "Gridiron Goats",
+  "pressure_score": 4,
+  "headline": "cannot fill RB, FLEX in week 6; short at WR.",
+  "by_week": [
+    { "week": 6, "players_on_bye": ["Christian McCaffrey", "Travis Kelce"],
+      "shortfalls": [{"slot": "RB", "eligible_positions": ["RB"]}],
+      "can_field_a_lineup": false }
+  ],
+  "thin_positions": [{"position": "TE", "healthy": 1, "starters_required": 1, "spare": 0}]
+}
+```
+
+Two details that keep the score meaningful:
+
+- **Dedicated slots are filled before flex slots.** A flex can be covered by three
+  positions and a WR slot cannot, so filling greedily in the other order would invent
+  shortfalls that do not exist.
+- **Kickers and defenses never count as thin.** Carrying exactly one of each is correct
+  roster construction and a replacement is always free on waivers. Counting them would
+  flag all twelve teams and tell you nothing. Positions with exactly enough bodies are
+  still *reported* under `thin_positions`, they just do not raise the score — only a real
+  shortfall does.
+
+Bye weeks are derived from the nflverse schedule: a team's bye is the regular-season week
+it does not appear in. Verified for 2026 — all 32 teams resolve, one bye each.
+
+### `POST /decision` and `GET /decisions` — your own calibration
+
+Log what you decided and why, at the moment you decide it, before you know how it went.
+Then record the outcome later.
+
+```bash
+curl -X POST -H "X-API-Key: $API_KEY" "https://your-domain.example/decision?\
+kind=waiver_bid&summary=Bid 14 on Bench Guy&reasoning=His max bid ever is 12&confidence=medium"
+# -> { "decision": { "decision_id": "9066f31e5d30", ... } }
+
+curl -X POST -H "X-API-Key: $API_KEY" \
+  "https://your-domain.example/decision/9066f31e5d30/outcome?outcome=Won it at 14, nobody else bid"
+```
+
+Outcomes are **appended, not edited**. The original call is preserved exactly as it was
+made, which is the part that matters when you go back to check your reasoning against
+what happened. `GET /decisions?pending_only=true` lists calls still awaiting an outcome.
+
+This is the slowest of the three to pay off and the only one that compounds across
+seasons: two years of these is the only way to find out whether you systematically
+overpay on waivers, or whether your close start/sit calls are coin flips. No public tool
+can tell you, because none of them knows what you decided or why.
+
 ## Keeping history
 
 The league runs for years; the caches above do not. They are overwritten on every
@@ -656,6 +759,9 @@ app/odds.py             The Odds API: consensus lines and game script
 app/espn.py             ESPN injuries and schedule (defensive parsing)
 app/weather.py          Open-Meteo forecasts, domes short-circuited
 app/draft.py            Rookie draft board: draft capital, combine, landing spot
+app/managers.py         Opponent profiles from transaction and draft history
+app/pressure.py         Structural gaps: bye collisions, injuries, no cover
+app/schedule.py         Bye weeks derived from the nflverse schedule
 app/teams.py            Static stadium coordinates, roof types, name aliases
 app/enrichment.py       The optional ?include= blocks on /snapshot
 app/history.py          Append-only JSONL archive + the /capture flow

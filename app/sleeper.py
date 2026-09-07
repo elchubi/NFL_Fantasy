@@ -129,6 +129,15 @@ class SleeperClient:
         data = await self.get(f"/league/{league_id}/transactions/{week}", allow_404=True)
         return data or []
 
+    async def drafts(self, league_id: str) -> list[dict[str, Any]]:
+        """Drafts for a league. Keeper leagues have one per season."""
+        data = await self.get(f"/league/{league_id}/drafts", allow_404=True)
+        return data or []
+
+    async def draft_picks(self, draft_id: str) -> list[dict[str, Any]]:
+        data = await self.get(f"/draft/{draft_id}/picks", allow_404=True)
+        return data or []
+
     async def all_players(self) -> dict[str, Any]:
         """The ~5MB NFL player file. Call at most once a day (see PlayerStore)."""
         settings = get_settings()

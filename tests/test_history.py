@@ -128,7 +128,7 @@ async def test_inventory_reports_what_is_archived(store):
 
 def test_reading_a_season_with_no_archive_is_empty_not_an_error(store):
     assert store.read("odds", 1999) == []
-    assert store.inventory() == {"odds": {}, "injuries": {}}
+    assert store.inventory() == {"odds": {}, "injuries": {}, "decisions": {}}
 
 
 def test_only_the_durable_fields_are_kept():

@@ -31,18 +31,24 @@ from typing import Any, Iterator
 
 log = logging.getLogger(__name__)
 
-SOURCES = ("odds", "injuries")
+SOURCES = ("odds", "injuries", "decisions")
+
+# Decisions are a log, not a state snapshot: every entry is kept, including two
+# identical ones, because "I made the same call again" is itself a fact.
+APPEND_ALWAYS = ("decisions",)
 
 # Fields compared to decide whether a row is a real change or a repeat.
 CHANGE_FIELDS: dict[str, tuple[str, ...]] = {
     "odds": ("home_spread", "away_spread", "total", "favourite", "moneyline"),
     "injuries": ("status", "practice_participation", "injury_type", "return_date"),
+    "decisions": (),
 }
 
 # What identifies the subject of a row within a (season, week).
 SUBJECT_FIELDS: dict[str, tuple[str, ...]] = {
     "odds": ("game_id",),
     "injuries": ("team", "espn_id", "name"),
+    "decisions": ("decision_id",),
 }
 
 
@@ -115,6 +121,8 @@ class HistoryStore:
 
     @staticmethod
     def _changed(source: str, new: dict[str, Any], previous: dict[str, Any] | None) -> bool:
+        if source in APPEND_ALWAYS:
+            return True
         if previous is None:
             return True
         return any(
@@ -404,3 +412,87 @@ async def auto_capture(
             )
     except Exception as exc:  # noqa: BLE001 - never fail the read it rode in on
         log.warning("Auto-capture of %s failed: %s", source, exc)
+
+
+# --- Decision log -------------------------------------------------------------
+
+DECISION_KINDS = (
+    "waiver_bid",
+    "trade",
+    "start_sit",
+    "draft_pick",
+    "keeper",
+    "drop",
+    "other",
+)
+
+
+def decision_row(
+    *,
+    kind: str,
+    summary: str,
+    reasoning: str | None = None,
+    players: list[str] | None = None,
+    confidence: str | None = None,
+    expected: str | None = None,
+    decision_id: str | None = None,
+) -> dict[str, Any]:
+    """One entry in the decision log.
+
+    The point is not record-keeping for its own sake. Two seasons of these,
+    read against what actually happened, is the only way to find out where your
+    process is systematically wrong - whether you overpay on waivers, whether
+    your close start/sit calls are coin flips. No public tool can tell you that
+    because no public tool knows what you decided or why.
+    """
+    import uuid
+
+    return {
+        "decision_id": decision_id or uuid.uuid4().hex[:12],
+        "kind": kind if kind in DECISION_KINDS else "other",
+        "kind_raw": kind,
+        "summary": summary,
+        "reasoning": reasoning,
+        "players": players or [],
+        "confidence": confidence,
+        "expected": expected,
+        "outcome": None,
+        "outcome_recorded_at": None,
+    }
+
+
+def apply_outcome(
+    rows: list[dict[str, Any]], decision_id: str, outcome: str
+) -> dict[str, Any] | None:
+    """Build the follow-up row that records how a decision turned out.
+
+    Outcomes are appended rather than edited: the archive stays append-only, and
+    the original call is preserved exactly as it was made, which is the part
+    that matters when you go back to check your reasoning.
+    """
+    original = next((r for r in rows if r.get("decision_id") == decision_id), None)
+    if original is None:
+        return None
+    return {
+        **{k: v for k, v in original.items() if k not in ("captured_at", "season", "week")},
+        "outcome": outcome,
+        "outcome_recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def pair_decisions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse the log into one entry per decision, newest outcome applied."""
+    by_id: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        decision_id = row.get("decision_id")
+        if not decision_id:
+            continue
+        existing = by_id.get(decision_id)
+        if existing is None:
+            by_id[decision_id] = dict(row)
+            continue
+        # Keep the original call; layer any outcome recorded later on top.
+        if row.get("outcome"):
+            existing["outcome"] = row["outcome"]
+            existing["outcome_recorded_at"] = row.get("outcome_recorded_at")
+    return sorted(by_id.values(), key=lambda r: r.get("captured_at") or "")
