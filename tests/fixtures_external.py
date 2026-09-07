@@ -191,3 +191,22 @@ OPEN_METEO = {
         "snowfall": [0.0, 0.0, 0.0, 0.0],
     },
 }
+
+
+# --- nflverse draft_picks / combine (columns verified against the live files) --
+
+DRAFT_PICKS_CSV = """season,round,pick,team,gsis_id,pfr_player_id,cfb_player_id,pfr_player_name,position,college,age
+2026,1,3,ARI,00-0041027,LoveJe00,jeremiyah-love-1,Jeremiyah Love,RB,Notre Dame,21
+2026,1,4,TEN,00-0041438,TateCa00,carnell-tate-1,Carnell Tate,WR,Ohio St.,21
+2026,2,40,GNB,00-0041500,SmitJo00,john-smith-1,John Smith,WR,Oregon,22
+2026,3,90,KAN,,BlacKa00,kaelon-black-1,Kaelon Black,RB,Penn St.,24
+2026,4,120,NWE,00-0041600,JoneDe00,derek-jones-1,Derek Jones,DE,Alabama,22
+2025,1,1,ARI,00-0039999,OldPl00,old-player-1,Old Player,RB,Texas,22
+"""
+
+COMBINE_CSV = """season,draft_year,draft_team,draft_round,draft_ovr,pfr_id,cfb_id,player_name,pos,school,ht,wt,forty,bench,vertical,broad_jump,cone,shuttle
+2026,2026,ARI,1,3,LoveJe00,jeremiyah-love-1,Jeremiyah Love,RB,Notre Dame,71,212,4.36,,38,124,,
+2026,2026,TEN,1,4,,carnell-tate-1,Carnell Tate,WR,Ohio St.,73,195,4.41,,36,,6.9,4.2
+2026,2026,GNB,2,40,SmitJo00,,John Smith,WR,Oregon,72,190,4.5,,,,,
+2025,2025,ARI,1,1,OldPl00,old-player-1,Old Player,RB,Texas,70,205,4.4,,,,,
+"""

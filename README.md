@@ -27,6 +27,8 @@ player file on disk.
 | `GET` | `/injury-report?team={abbr}` | `X-API-Key` | ESPN injury report for a whole team |
 | `GET` | `/weather/{week}` | `X-API-Key` | Kickoff weather for the week's outdoor venues |
 | `GET` | `/stadiums` | `X-API-Key` | The static stadium/dome reference used for weather |
+| `GET` | `/draft-class/{season}` | `X-API-Key` | Rookie draft board: capital, age, combine, landing spot |
+| `GET` | `/prospect/{player_id}` | `X-API-Key` | Draft profile for one player |
 | `POST` | `/capture` | `X-API-Key` | Archive this week's betting lines and injury reports |
 | `GET` | `/history` | `X-API-Key` | What is in the archive, per source and season |
 | `GET` | `/history/{source}` | `X-API-Key` | Read archived rows (`odds` or `injuries`) |
@@ -280,6 +282,87 @@ missing odds key or an ESPN outage costs you that block and nothing else:
 An unknown `include` value is rejected with `400` and the list of valid ones rather than
 being silently ignored.
 
+## Rookie draft board
+
+In a keeper league with one keeper you never stash prospects, so a rookie only matters
+if he produces **in his rookie season**. That narrows what is worth tracking a great
+deal. Roughly in order of how well they predict rookie-season fantasy production:
+
+| Signal | Where it comes from |
+| --- | --- |
+| **Draft capital** (round and pick) — the strongest single predictor, especially at RB | nflverse `draft_picks` |
+| **Age at draft** — younger is better, especially at WR | same file |
+| **Landing spot** — how much work actually vacated ahead of him | computed from the snap counts this service already pulls |
+| College market share / breakout age | *not included — see below* |
+| **Athletic testing** | nflverse `combine` |
+
+Four of the five come from two small nflverse files (~2.5MB together, no API key) plus
+data already on disk. The fifth is the only one that needs a college data source, and it
+is the weakest of the five, so **no NCAA source is used at all**. Pulling hundreds of
+megabytes of college play-by-play to answer something draft capital already answers
+better would be starting from the wrong end.
+
+`draft_picks` carries `gsis_id`, so every prospect lines up with the Sleeper rosters in
+`/snapshot` through the same index `/advanced-stats` uses.
+
+### Landing spot
+
+This is the part nothing else gives you, and it is the most actionable thing on draft
+day: a mid-round back walking into an empty backfield is worth more than a higher pick
+stuck behind a healthy starter.
+
+For each prospect it takes every player who logged snaps at that position for the
+drafting team last season, then checks each one's **current** team in the Sleeper player
+file. Anyone whose Sleeper team is no longer the drafting team has left, and their snaps
+are vacated. Both halves are data the service already holds.
+
+```json
+"landing_spot": {
+  "team": "NYJ", "position": "QB", "prior_season": 2025,
+  "vacated_share": 1.0,
+  "vacated_snap_points": 2.55,
+  "returning_snap_points": 0.0,
+  "incumbents": [
+    { "name": "Brady Cook",  "prior_snap_pct": 0.98, "current_team": "MIA", "still_on_team": false },
+    { "name": "Justin Fields","prior_snap_pct": 0.90, "current_team": "KC",  "still_on_team": false }
+  ],
+  "opportunity": "wide open at QB: 100% of last season's QB snap workload left the team; nobody established returns at the position."
+}
+```
+
+`vacated_share` is a **proportion of the position's snap workload**, not a sum of
+percentages. Three receivers are on the field at once, so their individual snap
+percentages add up well past 100% and summing them would be meaningless — an early
+version of this reported landing spots at "255% vacated". The raw sums are still
+exposed as `*_snap_points` for transparency.
+
+### Usage
+
+```bash
+# The whole class, best openings first
+curl -H "X-API-Key: $API_KEY" "https://your-domain.example/draft-class/2026"
+
+# Just the running backs taken in the first three rounds
+curl -H "X-API-Key: $API_KEY" "https://your-domain.example/draft-class/2026?position=RB&round_max=3"
+
+# One player, by Sleeper id or gsis_id
+curl -H "X-API-Key: $API_KEY" "https://your-domain.example/prospect/00-0041027"
+```
+
+`?landing=false` skips the landing-spot computation, which is the only part that needs
+last season's snap data.
+
+### If you ever want the college half
+
+The missing signal is college market share (dominator rating) and breakout age, from
+[collegefootballdata.com](https://collegefootballdata.com) — free, needs a key. One call
+a year for ~80 prospects, and a finished college season never changes, so that cache
+would need no TTL at all.
+
+The catch: nflverse's `cfb_player_id` is a College Football Reference slug
+(`jeremiyah-love-1`), **not** a CFBD id, so the join is name + school + year rather than
+a key lookup. Expect a handful of prospects a year to need checking by hand.
+
 ## Keeping history
 
 The league runs for years; the caches above do not. They are overwritten on every
@@ -504,8 +587,9 @@ Being straight about this, because two of these sources could not be reached fro
 machine this was built on:
 
 - **Verified against the live service.** nflverse: the column names, the `gsis_id` /
-  `pfr_id` join, the red zone aggregation and the season fallback were all built and
-  tested against the real release files. A cold build (four files, ~120MB) takes about
+  `pfr_id` join, the red zone aggregation, the season fallback, and the draft board
+  (2026 class: 80 skill picks, all with `gsis_id`, 70 matched to combine data) were all
+  built and tested against the real release files. A cold build (four files, ~120MB) takes about
   8 seconds and produces a ~5MB cache.
 - **Built from documented/observed shapes, not live-verified.** The Odds API, ESPN and
   Open-Meteo were unreachable from the build environment, so their parsing was written
@@ -571,6 +655,7 @@ app/nflverse.py         nflverse releases: download, join on gsis_id, aggregate
 app/odds.py             The Odds API: consensus lines and game script
 app/espn.py             ESPN injuries and schedule (defensive parsing)
 app/weather.py          Open-Meteo forecasts, domes short-circuited
+app/draft.py            Rookie draft board: draft capital, combine, landing spot
 app/teams.py            Static stadium coordinates, roof types, name aliases
 app/enrichment.py       The optional ?include= blocks on /snapshot
 app/history.py          Append-only JSONL archive + the /capture flow

@@ -81,6 +81,42 @@ TREND_FIELDS = ("snap_pct", "target_share", "targets", "carries", "red_zone_touc
 RECENT_WEEKS = 3
 
 
+async def _download_and_parse(
+    client: httpx.AsyncClient,
+    base_url: str,
+    release: str,
+    filename: str,
+    parser: Callable[[Path], Any],
+    timeout: float,
+    *,
+    allow_missing: bool = True,
+) -> Any:
+    """Download an nflverse release asset and parse it off the event loop.
+
+    The file lives in a temp dir for the duration of the parse and is deleted
+    afterwards; only the aggregate is kept. Parsing is CPU bound (a few seconds
+    for play-by-play), so it runs in a worker thread.
+    """
+    with tempfile.TemporaryDirectory(prefix="nflverse-") as tmpdir:
+        destination = Path(tmpdir) / filename
+        ok = await download_to_file(
+            client,
+            f"{base_url.rstrip('/')}/{release}/{filename}",
+            destination,
+            source="nflverse",
+            timeout=timeout,
+            allow_404=allow_missing,
+        )
+        if not ok:
+            return None
+        log.info(
+            "nflverse: downloaded %s (%.1f MB)",
+            filename,
+            destination.stat().st_size / 1_048_576,
+        )
+        return await asyncio.to_thread(parser, destination)
+
+
 def _num(value: Any) -> float | None:
     if value in (None, "", "NA", "NaN", "nan"):
         return None
@@ -268,31 +304,15 @@ class NflverseProvider:
         *,
         allow_missing: bool = True,
     ) -> Any:
-        """Download a release asset and parse it off the event loop.
-
-        The file lives in a temp dir for the duration of the parse and is
-        deleted afterwards; only the aggregate is kept.
-        """
-        with tempfile.TemporaryDirectory(prefix="nflverse-") as tmpdir:
-            destination = Path(tmpdir) / filename
-            ok = await download_to_file(
-                self._client,
-                self._url(release, filename),
-                destination,
-                source="nflverse",
-                timeout=self._settings.nflverse_download_timeout,
-                allow_404=allow_missing,
-            )
-            if not ok:
-                return None
-            log.info(
-                "nflverse: downloaded %s (%.1f MB)",
-                filename,
-                destination.stat().st_size / 1_048_576,
-            )
-            # Parsing is CPU bound (a few seconds for play-by-play), so keep it
-            # off the event loop.
-            return await asyncio.to_thread(parser, destination)
+        return await _download_and_parse(
+            self._client,
+            self._base_url,
+            release,
+            filename,
+            parser,
+            self._settings.nflverse_download_timeout,
+            allow_missing=allow_missing,
+        )
 
     async def _load_weekly_stats(self, season: int) -> dict[str, dict[str, Any]]:
         result = await self._with_csv(

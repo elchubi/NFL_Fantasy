@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__, enrichment, services
 from app.config import get_settings
+from app.draft import DraftProvider, landing_spot, require_prospect
 from app.espn import EspnProvider
 from app.history import SOURCES as HISTORY_SOURCES
 from app.history import HistoryStore, auto_capture, capture_week, injury_rows, odds_rows
@@ -46,13 +47,20 @@ nflverse = NflverseProvider(external_http)
 odds = OddsProvider(external_http)
 espn = EspnProvider(external_http)
 weather = WeatherProvider(external_http)
+draft = DraftProvider(external_http)
 
 # Append-only archive for betting lines and injury reports - the only two
 # sources that cannot be re-fetched from upstream once the week has passed.
 history = HistoryStore(settings.history_path())
 
 # Sources that keep a disk cache (warmed at startup).
-CACHED_PROVIDERS = {"nflverse": nflverse, "odds": odds, "espn": espn, "weather": weather}
+CACHED_PROVIDERS = {
+    "nflverse": nflverse,
+    "odds": odds,
+    "espn": espn,
+    "weather": weather,
+    "draft": draft,
+}
 
 # What the /snapshot blocks get. The history store rides along so those blocks
 # can archive whatever they pull fresh, the same as the read endpoints do.
@@ -412,6 +420,130 @@ async def weather_for_week(
 async def stadiums() -> dict[str, Any]:
     """Coordinates and roof type per team - useful for checking the dome list."""
     return {"count": len(STADIUMS), "stadiums": all_stadiums()}
+
+
+@app.get(
+    "/draft-class/{season}",
+    tags=["draft"],
+    dependencies=[Depends(require_api_key)],
+    summary="Rookie draft board for one class",
+)
+async def draft_class(
+    season: int = Path(ge=1980, le=2100, description="Draft year, e.g. 2026."),
+    position: str | None = Query(
+        default=None, description="Filter to one of QB, RB, WR, TE."
+    ),
+    round_max: int | None = Query(
+        default=None, ge=1, le=7, description="Only picks in this round or earlier."
+    ),
+    landing: bool = Query(
+        default=True,
+        description=(
+            "Compute how much work vacated at each player's position on his new "
+            "team, from last season's snap counts."
+        ),
+    ),
+) -> dict[str, Any]:
+    """Every skill-position pick with draft capital, age, combine and landing spot.
+
+    Built from nflverse's draft_picks and combine releases. draft_picks carries
+    `gsis_id`, so each prospect lines up with the Sleeper rosters in /snapshot.
+    """
+    data, meta = await draft.class_for(season)
+    prospects = list((data.get("prospects") or {}).values())
+
+    if position:
+        wanted = position.strip().upper()
+        prospects = [p for p in prospects if p["position"] == wanted]
+    if round_max:
+        prospects = [p for p in prospects if (p["draft"]["round"] or 99) <= round_max]
+
+    prospects.sort(key=lambda p: (p["draft"]["round"] or 99, p["draft"]["pick_in_round"] or 999))
+
+    if landing and prospects:
+        await players.ensure_fresh()
+        prior, _ = await nflverse.season_data(season - 1)
+        prospects = [
+            {**p, "landing_spot": landing_spot(p, prior, players)} for p in prospects
+        ]
+
+    return {
+        "season": season,
+        "count": len(prospects),
+        "counts": data.get("counts"),
+        "prospects": [_with_sleeper(p) for p in prospects],
+        "cache": meta,
+        "note": (
+            "Draft capital and age are the strongest rookie-season predictors; "
+            "landing_spot is computed from last season's snap counts and each "
+            "incumbent's current Sleeper team. No college data source is used."
+        ),
+    }
+
+
+@app.get(
+    "/prospect/{player_id}",
+    tags=["draft"],
+    dependencies=[Depends(require_api_key)],
+    summary="Draft profile for one player",
+)
+async def prospect(
+    player_id: str = Path(description="Sleeper player id, or an nflverse gsis_id."),
+    season: int | None = Query(
+        default=None, ge=1980, le=2100, description="Draft year. Defaults to a lookup."
+    ),
+) -> dict[str, Any]:
+    """One prospect's draft capital, combine numbers and landing spot."""
+    await players.ensure_fresh()
+
+    # Accept either id: gsis ids look like 00-00xxxxx.
+    gsis = player_id if player_id.startswith("00-0") else players.gsis_id(player_id)
+    if not gsis:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"'{player_id}' has no gsis_id in the Sleeper player file, so it "
+                "cannot be matched to a draft pick."
+            ),
+        )
+
+    target_season = season or await _draft_season_for(gsis)
+    data, meta = await draft.class_for(target_season)
+    found = require_prospect(data, gsis)
+
+    prior, _ = await nflverse.season_data(target_season - 1)
+    return {
+        "season": target_season,
+        "prospect": _with_sleeper({**found, "landing_spot": landing_spot(found, prior, players)}),
+        "cache": meta,
+    }
+
+
+async def _draft_season_for(gsis: str) -> int:
+    """Find which class a gsis_id belongs to, newest first."""
+    current = await current_season()
+    for candidate in range(current, current - 6, -1):
+        data, _ = await draft.class_for(candidate)
+        if gsis in (data.get("prospects") or {}):
+            return candidate
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            f"No skill-position pick in the last six draft classes matches {gsis}. "
+            "Pass ?season= to check an older class."
+        ),
+    )
+
+
+def _with_sleeper(prospect: dict[str, Any]) -> dict[str, Any]:
+    """Attach the Sleeper player id so the prospect lines up with /snapshot."""
+    gsis = prospect.get("gsis_id")
+    sleeper_id = players.sleeper_id_for_gsis(gsis) if gsis else None
+    return {
+        **prospect,
+        "sleeper_player_id": sleeper_id,
+        "sleeper_player": players.resolve(sleeper_id) if sleeper_id else None,
+    }
 
 
 @app.post(

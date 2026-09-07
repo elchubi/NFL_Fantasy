@@ -60,8 +60,17 @@ NICKNAME_TO_ABBR: dict[str, str] = {
 for _nick in ("giants", "jets"):
     NICKNAME_TO_ABBR.pop(_nick, None)
 
-# Abbreviations that other sources use for the same team.
+# Abbreviations that other sources use for the same team. The GNB/KAN/NWE
+# family is Pro-Football-Reference's, which is what nflverse's draft_picks and
+# combine releases carry.
 ABBR_ALIASES: dict[str, str] = {
+    "GNB": "GB",
+    "KAN": "KC",
+    "LVR": "LV",
+    "NOR": "NO",
+    "NWE": "NE",
+    "SFO": "SF",
+    "TAM": "TB",
     "JAC": "JAX",
     "LA": "LAR",
     "SD": "LAC",
