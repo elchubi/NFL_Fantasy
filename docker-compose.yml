@@ -1,0 +1,36 @@
+services:
+  sleeper-api:
+    build: .
+    # Coolify can also pull a prebuilt image instead of building:
+    # image: ghcr.io/<your-user>/sleeper-fantasy-api:latest
+    container_name: sleeper-fantasy-api
+    restart: unless-stopped
+    environment:
+      # Required
+      LEAGUE_ID: ${LEAGUE_ID:?set LEAGUE_ID in your .env}
+      API_KEY: ${API_KEY:?set API_KEY in your .env}
+      # Optional (defaults shown)
+      PLAYERS_CACHE_PATH: /data/players_cache.json
+      PLAYERS_CACHE_TTL_HOURS: ${PLAYERS_CACHE_TTL_HOURS:-20}
+      HTTP_TIMEOUT: ${HTTP_TIMEOUT:-20}
+      PLAYERS_HTTP_TIMEOUT: ${PLAYERS_HTTP_TIMEOUT:-120}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "${PORT:-8000}:8000"
+    volumes:
+      # Keeps the ~5MB player file across restarts so Sleeper is only hit once a day.
+      - players-cache:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  players-cache:
