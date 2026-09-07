@@ -1072,6 +1072,23 @@ The first real call to `/injury-report?team=KC` is the one worth eyeballing: if
 and `parse_injuries` in `public_data/app/espn.py` needs a new key added to
 `_candidate_lists`.
 
+### Known gap: `/available` can surface a long-retired player
+
+Confirmed on a live deploy: `/leagues/{league}/available` recommended Philip Rivers
+(retired since the 2020 season) at QB. `/available` filters out anyone whose Sleeper
+`status` is not one of `Active`, `Injured Reserve`, `PUP`, `Non Football Injury`,
+`Suspended` or `Practice Squad` - which does catch most stale entries (confirmed it
+correctly dropped two other players in the same live check) - but Rivers' own Sleeper
+record still reports `status: "Active"`. The nflverse season fallback only ever steps back
+one year (2026 → 2025, never further), and 2025 is a complete real season, so this is not
+stale-season data leaking through - it is Sleeper's own player record being wrong for this
+one player, most likely a bad `gsis_id` cross-reference rather than anything this codebase
+computes. A "how old is this player's most recent season" heuristic was considered and
+rejected: given the fallback already never goes back more than a year, it would not have
+caught this specific case anyway, and risks dropping a legitimately rostered player who
+simply missed last season to injury. Flagging it here rather than guessing at a fix that
+cannot be verified without live access to Sleeper's and nflverse's real data.
+
 ## How it behaves against Sleeper
 
 - **Player file**: fetched at most once per `PLAYERS_CACHE_TTL_HOURS` (20h by default),
