@@ -55,7 +55,15 @@ mcp = MCPServer(
         "Start with league_snapshot for the current state of the league. Use "
         "manager_pressure and manager_list when the question is about trading "
         "with or bidding against another manager - those are specific to this "
-        "league and are not available anywhere else."
+        "league and are not available anywhere else.\n\n"
+        "manager_list and manager_profile report a `source` field: 'archive' means "
+        "they read multi-season history, 'live (current season only)' means "
+        "history_backfill has never been run. If the user asks anything that "
+        "would benefit from past seasons (career FAAB behaviour, draft tendencies "
+        "over time, how a manager has trended) and source is 'live', call "
+        "history_backfill once yourself before answering, then retry the read - "
+        "no need to ask permission first, it only reads from Sleeper and archives "
+        "to this league's own database."
     ),
 )
 
