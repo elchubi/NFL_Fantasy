@@ -29,6 +29,10 @@ ROSTERED_RB_GSIS = "00-0011111"
 # gsis_id, and who nobody has rostered either - but is not a real pickup.
 RETIRED_ID = "8899"
 RETIRED_GSIS = "00-0088888"
+# status "Active" but no current NFL team - e.g. a season-ending injury
+# Sleeper has not fully updated the status for yet.
+NO_TEAM_ID = "9911"
+NO_TEAM_GSIS = "00-0077777"
 
 
 @pytest.fixture
@@ -57,6 +61,15 @@ def client(monkeypatch, tmp_path):
         {
             "first_name": "Long", "last_name": "Retired", "position": "RB",
             "team": "IND", "status": None, "gsis_id": RETIRED_GSIS,
+        },
+    )
+    main.players._players[NO_TEAM_ID] = _slim(
+        NO_TEAM_ID,
+        {
+            # No "team" key at all - same shape Sleeper sends for a player
+            # with no current NFL team.
+            "first_name": "No", "last_name": "Team", "position": "RB",
+            "status": "Active", "gsis_id": NO_TEAM_GSIS,
         },
     )
     main.players._reindex()
@@ -96,6 +109,15 @@ def client(monkeypatch, tmp_path):
                         "season_total_points": 90.0, "season_average_points": 30.0,
                         "recent_average_points": 30.0,
                     },
+                    {
+                        # Same idea: best numbers of all, so the top-N sort
+                        # alone would surface it first if the nfl_team check
+                        # were not there.
+                        "gsis_id": NO_TEAM_GSIS, "name": "No Team", "team": None,
+                        "games": 3, "weekly_points": {"1": 40.0, "2": 40.0, "3": 40.0},
+                        "season_total_points": 120.0, "season_average_points": 40.0,
+                        "recent_average_points": 40.0,
+                    },
                 ],
             }
         return {"season": 2025, "position": path.rsplit("/", 1)[-1], "scoring_not_applied": [], "players": []}
@@ -125,6 +147,15 @@ def test_a_player_with_no_active_status_is_excluded_even_unrostered(client):
     response = client.get("/leagues/main/available?position=RB", headers=HEADERS)
     ids = [p["player_id"] for p in response.json()["available"]["RB"]]
     assert RETIRED_ID not in ids
+
+
+def test_a_player_with_no_current_nfl_team_is_excluded_even_if_active(client):
+    """Confirmed live: Tyreek Hill's own Sleeper record reports status
+    "Active" with nfl_team null and an ACL surgery note - status alone does
+    not catch this, since "Active" is a legitimately rosterable status."""
+    response = client.get("/leagues/main/available?position=RB", headers=HEADERS)
+    ids = [p["player_id"] for p in response.json()["available"]["RB"]]
+    assert NO_TEAM_ID not in ids
 
 
 def test_unsupported_scoring_keys_are_reported_not_hidden(client):

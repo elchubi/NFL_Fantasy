@@ -331,6 +331,12 @@ async def available_players(
             # pickup" list could recommend someone who last played years ago.
             if resolved.get("status") not in _ROSTERABLE_STATUSES:
                 continue
+            # A player with no current NFL team cannot actually be added off
+            # waivers, whatever `status` says - confirmed live: Tyreek Hill's
+            # own record reports status "Active" with nfl_team null and an
+            # ACL surgery note, which the status check alone does not catch.
+            if not resolved.get("nfl_team"):
+                continue
             candidates.append(
                 {
                     "player_id": sleeper_id,

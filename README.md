@@ -1089,6 +1089,12 @@ caught this specific case anyway, and risks dropping a legitimately rostered pla
 simply missed last season to injury. Flagging it here rather than guessing at a fix that
 cannot be verified without live access to Sleeper's and nflverse's real data.
 
+A related, narrower case *was* fixed the same way: `/available` also excludes anyone with
+no current `nfl_team` on file, after live testing turned up Tyreek Hill with `status:
+"Active"` (so the check above alone would not catch him), `nfl_team: null`, and an ACL
+surgery note - a real signal already present in Sleeper's own data, not a guess, which is
+why this one was implemented and the season-age heuristic above was not.
+
 ## How it behaves against Sleeper
 
 - **Player file**: fetched at most once per `PLAYERS_CACHE_TTL_HOURS` (20h by default),
