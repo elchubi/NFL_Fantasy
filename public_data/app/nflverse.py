@@ -7,9 +7,15 @@ Three CSV releases are combined into one per-player view, keyed by `gsis_id`
                                                   air yards, EPA, fantasy points
     snap_counts/snap_counts_<season>.csv          snap counts and snap %
     pbp/play_by_play_<season>.csv                 red zone touches (optional)
+    injuries/injuries_<season>.csv                the NFL's own weekly injury
+                                                  report: report status
+                                                  (Out/Doubtful/Questionable) and
+                                                  practice participation (Full/
+                                                  Limited/Did Not Participate)
 
 snap_counts is keyed by Pro-Football-Reference id rather than gsis_id, so
-`players/players.csv` is pulled as the id crosswalk between the two.
+`players/players.csv` is pulled as the id crosswalk between the two. injuries
+carries gsis_id directly, same as stats_player.
 
 The play-by-play file is ~98MB and is the only place red zone usage exists;
 it is streamed to disk, aggregated in one pass (a couple of seconds, no pandas)
@@ -17,6 +23,16 @@ and then deleted. Set NFLVERSE_INCLUDE_RED_ZONE=false to skip it.
 
 Everything is refreshed at most once every NFLVERSE_CACHE_TTL_HOURS (24h by
 default), which matches how often nflverse publishes.
+
+injuries is a second, independent source for the same ground truth ESPN's
+site API reports (see `app/espn.py`) - kept side by side rather than as a
+replacement, since ESPN updates faster within a day (a live scrape) while
+this is the league's own official weekly report, published as a static
+GitHub release file rather than a scraped live endpoint. That difference is
+exactly why this one still works from Railway when ESPN's live API 403s
+every request (see README's "Known gap: ESPN's site API 403s every request
+from Railway") - and why, if ESPN ever becomes reachable again, both are
+worth keeping rather than dropping one for the other.
 """
 
 from __future__ import annotations
@@ -148,6 +164,7 @@ class NflverseProvider:
         self._base_url = settings.nflverse_base_url.rstrip("/")
         # Memo so the "is this season published yet?" fallback is decided once.
         self._resolved_season: dict[int, int] = {}
+        self._resolved_injury_season: dict[int, int] = {}
         self.cache = KeyedDiskCache(
             settings.cache_path("nflverse_cache.json"),
             name="nflverse",
@@ -179,6 +196,74 @@ class NflverseProvider:
             if data.get("players"):
                 self._resolved_season[requested] = previous
         return data, meta
+
+    async def injuries_for_season(self, season: int) -> tuple[dict[str, Any], dict[str, Any]]:
+        """The season's weekly injury reports, falling back to the previous
+        season the same way `season_data` does - the report only starts
+        filling in once practices begin, so a brand new season can be empty
+        for a while after the schedule itself is out."""
+        requested = season
+        season = self._resolved_injury_season.get(requested, requested)
+
+        data, meta = await self.cache.get_or_refresh(
+            f"injuries:{season}", lambda: self._build_injuries(season)
+        )
+        if not data.get("players") and season > 2000:
+            previous = season - 1
+            data, meta = await self.cache.get_or_refresh(
+                f"injuries:{previous}", lambda: self._build_injuries(previous)
+            )
+            if data.get("players"):
+                self._resolved_injury_season[requested] = previous
+        return data, meta
+
+    async def team_injuries(self, team: str, season: int) -> dict[str, Any]:
+        """Each of a team's players' most recently reported week this season.
+
+        This is a weekly-cadence static file, not a live feed, so "most
+        recent week on file" is the closest equivalent to ESPN's live
+        snapshot - not necessarily this week's report if nflverse hasn't
+        published it yet.
+        """
+        data, meta = await self.injuries_for_season(season)
+        players = data.get("players") or {}
+        report = []
+        for player in players.values():
+            if (player.get("team") or "").upper() != team.upper():
+                continue
+            weeks = player.get("weeks") or {}
+            if not weeks:
+                continue
+            last_week = max(weeks, key=int)
+            report.append({
+                "gsis_id": player["gsis_id"],
+                "name": player.get("name"),
+                "position": player.get("position"),
+                "team": player.get("team"),
+                **weeks[last_week],
+            })
+        return {
+            "team": team.upper(),
+            "season": data.get("season"),
+            "injuries": report,
+            "source_available": bool(players),
+            "cache": meta,
+        }
+
+    async def player_injury_report(self, gsis_id: str, season: int) -> dict[str, Any]:
+        """One player's full weekly injury/practice history for the season."""
+        data, meta = await self.injuries_for_season(season)
+        players = data.get("players") or {}
+        player = players.get(str(gsis_id))
+        weeks = player.get("weeks") if player else {}
+        return {
+            "gsis_id": gsis_id,
+            "season": data.get("season"),
+            "found": player is not None,
+            "by_week": [weeks[w] for w in sorted(weeks, key=int)] if weeks else [],
+            "source_available": bool(players),
+            "cache": meta,
+        }
 
     async def position_points(
         self, position: str, season: int, scoring_settings: dict[str, Any]
@@ -440,6 +525,12 @@ class NflverseProvider:
         )
         return result or {}
 
+    async def _build_injuries(self, season: int) -> dict[str, Any]:
+        players = await self._with_csv(
+            "injuries", f"injuries_{season}.csv", _parse_injuries
+        )
+        return {"season": season, "players": players or {}}
+
     # --- Serving --------------------------------------------------------------
 
     async def for_gsis_id(self, gsis_id: str, season: int) -> dict[str, Any]:
@@ -612,6 +703,58 @@ def _parse_red_zone(path: Path) -> dict[tuple[str, str], dict[str, Any]]:
         key: {**value, "red_zone_touches": value["red_zone_carries"] + value["red_zone_targets"]}
         for key, value in counts.items()
     }
+
+
+# Columns kept from injuries_<season>.csv, alongside gsis_id/full_name/
+# position/team/week which are handled separately below.
+INJURY_FIELDS = (
+    "report_status",
+    "report_primary_injury",
+    "report_secondary_injury",
+    "practice_status",
+    "practice_primary_injury",
+    "practice_secondary_injury",
+    "date_modified",
+)
+
+
+def _parse_injuries(path: Path) -> dict[str, dict[str, Any]]:
+    """injuries_<season>.csv -> {gsis_id: {..., weeks: {week: row}}}.
+
+    One row per player per week they were on the report. `report_status` is
+    Out/Doubtful/Questionable (absent once a player is fully cleared);
+    `practice_status` is the NFL's own wording for Full/Limited/Did Not
+    Participate. Same defensive posture as the other nflverse parsers: an
+    unrecognised or missing column degrades to that field being absent
+    rather than raising, since this is still an unversioned community release.
+    """
+    players: dict[str, dict[str, Any]] = {}
+    with path.open(newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            gsis = row.get("gsis_id")
+            week = row.get("week")
+            if not gsis or gsis == "NA" or not week:
+                continue
+
+            player = players.setdefault(
+                gsis,
+                {
+                    "gsis_id": gsis,
+                    "name": row.get("full_name"),
+                    "position": row.get("position"),
+                    "team": row.get("team"),
+                    "weeks": {},
+                },
+            )
+            player["team"] = row.get("team") or player["team"]
+
+            entry: dict[str, Any] = {"week": int(week)}
+            for field in INJURY_FIELDS:
+                value = row.get(field)
+                if value not in (None, "", "NA"):
+                    entry[field] = value
+            player["weeks"][str(week)] = entry
+    return players
 
 
 def _compact(player: dict[str, Any]) -> None:

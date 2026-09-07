@@ -246,6 +246,109 @@ def test_kickoff_maps_to_an_nfl_week():
     assert odds._week_from_kickoff("not-a-date") is None
 
 
+# --- nflverse injuries (second source alongside ESPN) --------------------------
+
+
+def test_injuries_are_parsed_and_keyed_by_gsis_id(tmp_path):
+    players = nflverse._parse_injuries(_write(tmp_path, "i.csv", fx.INJURIES_CSV))
+    assert set(players) == {"00-0034796", "00-0036322"}
+
+    cmc = players["00-0034796"]
+    assert cmc["name"] == "Christian McCaffrey"
+    assert cmc["team"] == "SF"
+    week1 = cmc["weeks"]["1"]
+    assert week1["report_status"] == "Questionable"
+    assert week1["practice_status"] == "Limited Participation in Practice"
+
+    # Week 2: cleared - report_status blank in the source row must not become
+    # the literal string "" on the parsed entry.
+    week2 = cmc["weeks"]["2"]
+    assert "report_status" not in week2
+    assert week2["practice_status"] == "Full Participation in Practice"
+
+
+async def test_team_injuries_returns_each_players_most_recent_week():
+    provider = nflverse.NflverseProvider.__new__(nflverse.NflverseProvider)
+
+    async def fake_injuries_for_season(season):
+        return (
+            {
+                "season": season,
+                "players": {
+                    "00-0034796": {
+                        "gsis_id": "00-0034796",
+                        "name": "Christian McCaffrey",
+                        "position": "RB",
+                        "team": "SF",
+                        "weeks": {
+                            "1": {"week": 1, "report_status": "Questionable"},
+                            "2": {"week": 2, "practice_status": "Full Participation in Practice"},
+                        },
+                    },
+                    "00-0036322": {
+                        "gsis_id": "00-0036322",
+                        "name": "Justin Jefferson",
+                        "position": "WR",
+                        "team": "MIN",
+                        "weeks": {"1": {"week": 1, "report_status": "Doubtful"}},
+                    },
+                },
+            },
+            {},
+        )
+
+    provider.injuries_for_season = fake_injuries_for_season
+
+    result = await provider.team_injuries("SF", 2025)
+    assert result["source_available"] is True
+    assert len(result["injuries"]) == 1
+    cmc = result["injuries"][0]
+    # Week 2 (most recent), not week 1 - the stale "Questionable" from week 1
+    # must not shadow the player having since been cleared.
+    assert cmc["week"] == 2
+    assert "report_status" not in cmc
+    assert cmc["practice_status"] == "Full Participation in Practice"
+
+    # Team match is case-insensitive and only returns that team's players.
+    other = await provider.team_injuries("sf", 2025)
+    assert len(other["injuries"]) == 1
+
+
+async def test_player_injury_report_returns_the_full_weekly_history():
+    provider = nflverse.NflverseProvider.__new__(nflverse.NflverseProvider)
+
+    async def fake_injuries_for_season(season):
+        return (
+            {
+                "season": season,
+                "players": {
+                    "00-0034796": {
+                        "gsis_id": "00-0034796",
+                        "weeks": {
+                            "2": {"week": 2, "report_status": "Out"},
+                            "1": {"week": 1, "report_status": "Questionable"},
+                        },
+                    }
+                },
+            },
+            {},
+        )
+
+    provider.injuries_for_season = fake_injuries_for_season
+
+    result = await provider.player_injury_report("00-0034796", 2025)
+    assert result["found"] is True
+    # Ordered by week even though the source dict wasn't.
+    assert [w["week"] for w in result["by_week"]] == [1, 2]
+
+    missing = await provider.player_injury_report("00-0000000", 2025)
+    assert missing["found"] is False
+    assert missing["by_week"] == []
+    # A player not being on the report is different from the source itself
+    # being unreachable - other players were found, so it is available.
+    assert missing["source_available"] is True
+
+
 # --- ESPN ---------------------------------------------------------------------
 
 

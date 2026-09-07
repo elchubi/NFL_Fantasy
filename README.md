@@ -74,8 +74,8 @@ resolution, the external sources, the draft board) and stay at a plain path.
 | --- | --- | --- | --- |
 | `GET` | `/advanced-stats/{player_id}` | `player_id`, `season` | nflverse: snap %, target share, air yards, red zone touches, EPA. Season average, last-three-week average and the delta — the earliest read on a role change. |
 | `GET` | `/odds/{week}` | `week`, `season` | The Odds API: spread, total, moneyline, favourite, implied team totals and a game-script note. Consensus is the median across books. Passes through your remaining quota. |
-| `GET` | `/injury-report` | `team` **(required)** | ESPN: a team's full injury report with practice participation (full / limited / did_not_practice). |
-| `GET` | `/injury-report/{player_id}` | `player_id` | ESPN for one player, next to what Sleeper has cached, so you can see when they disagree. |
+| `GET` | `/injury-report` | `team` **(required)** | ESPN and nflverse, side by side: a team's full injury report with practice participation (full / limited / did_not_practice). |
+| `GET` | `/injury-report/{player_id}` | `player_id` | ESPN and nflverse for one player, next to what Sleeper has cached, so you can see when they disagree. |
 | `GET` | `/weather/{week}` | `week`, `season` | Open-Meteo: forecast at the kickoff hour per stadium. Domes return `indoor: true` without any API call. |
 | `GET` | `/stadiums` | — | The static reference: coordinates and roof type for all 32 stadiums. |
 | `POST` | `/position-points/{position}` | `position`, `season`; body `scoring_settings` **(required)** | Every player at a position, scored week by week under a league's own rules instead of nflverse's fixed PPR column. |
@@ -1120,6 +1120,22 @@ raising - the same treatment a 404 already gets. Both of `EspnProvider`'s call s
 (and `/weather/{week}` to `available: false`) instead of a 502 taking down the whole
 endpoint. Every other source keeps failing loudly on a 401/403, since for them it usually
 means a real misconfiguration (a bad API key) worth surfacing, not hiding.
+
+**A second, independent source was added rather than waiting on ESPN.** nflverse also
+publishes the NFL's own official weekly injury report (`injuries/injuries_<season>.csv` -
+same GitHub Releases mechanism as `stats_player`/`snap_counts`, which is what let it work
+from Railway when ESPN's live API doesn't: a static file download isn't a scraped request a
+site can bot-detect). `NflverseProvider.team_injuries()` and `.player_injury_report()`
+(`public_data/app/nflverse.py`) serve it, and `/injury-report` and `/injury-report/{id}`
+now return both `espn_report`/`espn_id`-keyed data and a `nflverse_report` field side by
+side - kept as two sources rather than one replacing the other, so if ESPN's block ever
+lifts there is no follow-up migration needed. The trade-off: nflverse's report is
+weekly-cadence (the league's official filing), not live like ESPN's scrape, so
+`team_injuries()` serves each player's *most recently published* week, which may lag a day
+or two behind a mid-week practice-report update. Same caveat as ESPN's own parsing: this is
+built from nflreadr's documented `load_injuries()` column names, not live-verified against
+the real release file (unreachable from the build environment - see "What was and wasn't
+verified"), so the first real call is worth eyeballing.
 
 ## How it behaves against Sleeper
 

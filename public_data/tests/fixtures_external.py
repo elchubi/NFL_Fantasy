@@ -41,6 +41,15 @@ PBP_CSV = """week,posteam,yardline_100,play_type,rush_attempt,pass_attempt,touch
 2,SF,3,run,1,0,1,0,NA,00-0034796
 """
 
+# Column names follow nflreadr's documented `load_injuries()` schema, not
+# live-verified (same caveat as ESPN - see README's "What was and wasn't
+# verified"). Two players, two weeks each, one of them cleared by week 2.
+INJURIES_CSV = """season,game_type,team,week,gsis_id,position,full_name,first_name,last_name,report_primary_injury,report_secondary_injury,report_status,practice_primary_injury,practice_secondary_injury,practice_status,date_modified
+2025,REG,SF,1,00-0034796,RB,Christian McCaffrey,Christian,McCaffrey,Achilles,,Questionable,Achilles,,Limited Participation in Practice,2025-09-10
+2025,REG,SF,2,00-0034796,RB,Christian McCaffrey,Christian,McCaffrey,,,,,,Full Participation in Practice,2025-09-17
+2025,REG,MIN,1,00-0036322,WR,Justin Jefferson,Justin,Jefferson,Hamstring,,Doubtful,Hamstring,,Did Not Participate In Practice,2025-09-11
+"""
+
 # --- The Odds API -------------------------------------------------------------
 
 ODDS_PAYLOAD = [

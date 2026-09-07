@@ -247,11 +247,18 @@ async def odds_for_week(
 async def injury_report_by_team(
     team: str = Query(description=f"NFL team abbreviation, one of: {', '.join(sorted(STADIUMS))}.")
 ) -> dict[str, Any]:
-    """Every listed injury for a team, with practice participation when ESPN
-    includes it in the note (full / limited / did_not_practice)."""
-    report = await espn.team_report(team)
-    await _archive_injuries(report)
-    return report
+    """Every listed injury for a team, from ESPN and from nflverse's own copy
+    of the NFL's official weekly report - two independent sources for the
+    same ground truth, kept side by side rather than one replacing the other.
+    ESPN is unofficial and updates faster within a day; nflverse is the
+    official weekly filing, published as a static file rather than a live
+    scrape (see README's "Known gap: ESPN's site API 403s every request from
+    Railway" for why that difference matters here)."""
+    espn_report = await espn.team_report(team)
+    await _archive_injuries(espn_report)
+    target_season = await current_season()
+    nflverse_report = await nflverse.team_injuries(espn_report["team"], target_season)
+    return {**espn_report, "nflverse_report": nflverse_report}
 
 
 @app.get(
@@ -261,10 +268,13 @@ async def injury_report_by_team(
     summary="ESPN injury detail for one player",
 )
 async def injury_report_by_player(player_id: str = Path(description="Sleeper player id.")) -> dict[str, Any]:
-    """ESPN's report for a single player, next to what Sleeper has cached.
+    """ESPN's and nflverse's reports for a single player, next to what Sleeper
+    has cached - two independent sources for the same ground truth, kept side
+    by side (see `/injury-report`'s summary for why).
 
-    Matched on `espn_id` from the Sleeper player file, falling back to an exact
-    name match within the player's own team.
+    ESPN is matched on `espn_id` from the Sleeper player file, falling back to
+    an exact name match within the player's own team. nflverse is matched on
+    `gsis_id`, when Sleeper has one on file for this player.
     """
     await players.ensure_fresh()
     sleeper_player = players.resolve(player_id)
@@ -277,7 +287,7 @@ async def injury_report_by_player(player_id: str = Path(description="Sleeper pla
             status_code=404,
             detail=(
                 f"{sleeper_player['name']} has no NFL team on file, so there is no "
-                "ESPN team report to look them up in."
+                "team report to look them up in."
             ),
         )
 
@@ -294,12 +304,26 @@ async def injury_report_by_player(player_id: str = Path(description="Sleeper pla
         if " ".join(str(item.get("name", "")).lower().split()) == needle:
             match = item
 
+    gsis_id = players.gsis_id(player_id)
+    if gsis_id:
+        target_season = await current_season()
+        nflverse_report = await nflverse.player_injury_report(gsis_id, target_season)
+    else:
+        nflverse_report = {
+            "gsis_id": None,
+            "found": False,
+            "by_week": [],
+            "source_available": None,
+            "note": "Sleeper has no gsis_id for this player, so there is no way to join them to nflverse.",
+        }
+
     return {
         "player": sleeper_player,
         "nfl_team": team,
         "espn_id": espn_id,
         "listed": match is not None,
         "espn_report": match,
+        "nflverse_report": nflverse_report,
         "sleeper_injury_status": sleeper_player.get("injury_status"),
         "note": None if match else f"{sleeper_player['name']} is not on ESPN's injury report for {team}.",
         "source_available": report.get("source_available"),
