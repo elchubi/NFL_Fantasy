@@ -556,6 +556,29 @@ async def manager_faab_bid(
 
 
 @mcp.tool(
+    name="manager_briefing",
+    annotations=READ_ONLY,
+    description=(
+        "A weekly digest for one roster: injuries where ESPN and Sleeper "
+        "disagree, byes coming up in the next two weeks, thin positions, the "
+        "top trending free agents, and weather concerns for your players' "
+        "games. Merges five separate reads into one - use it as the first "
+        "call of a weekly check-in instead of calling each one separately."
+    ),
+)
+async def manager_briefing(manager: str, league: str | None = None, week: int | None = None) -> Any:
+    """
+    Args:
+        manager: Username, display name or team name.
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
+        week: Defaults to the current week.
+    """
+    lid = _resolve_league(league)
+    return await _get(f"/leagues/{lid}/briefing/{manager}", params={"week": week})
+
+
+@mcp.tool(
     name="decision_log",
     annotations=APPEND_ONLY,
     description=(
@@ -892,7 +915,7 @@ TOOL_NAMES = [
     "stats_advanced", "stats_odds", "stats_injury_report_team",
     "stats_injury_report_player", "stats_weather", "stats_stadiums",
     "manager_list", "manager_profile", "manager_pressure", "manager_playoff_odds",
-    "manager_trade_fits", "manager_faab_bid",
+    "manager_trade_fits", "manager_faab_bid", "manager_briefing",
     "decision_log", "decision_log_outcome", "decision_list",
     "draft_class", "draft_prospect",
     "history_backfill", "history_seasons",

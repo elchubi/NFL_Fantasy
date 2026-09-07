@@ -1113,6 +1113,126 @@ async def faab_bid(
     }
 
 
+@app.get(
+    "/leagues/{league}/briefing/{manager}",
+    tags=["edge"],
+    dependencies=[Depends(require_api_key)],
+    summary="One weekly digest for your own roster",
+)
+async def weekly_briefing(
+    league: str = Path(description="A slug from GET /leagues."),
+    manager: str = Path(description="Username, display name or team name."),
+    week: int | None = Query(default=None, ge=1, le=22),
+) -> dict[str, Any]:
+    """Merges what would otherwise be five separate calls into one weekly
+    read on your own roster: injuries where ESPN and Sleeper disagree,
+    byes coming up in the next two weeks, thin positions, the top trending
+    free agents, and weather concerns for your players' games this week.
+
+    Nothing here is computed specially for this endpoint - each block reuses
+    the same logic as its own endpoint (/injury-report, /byes, /pressure,
+    /available, /weather) and simply reports its own failure rather than
+    failing the whole briefing, the same contract /snapshot's `include`
+    blocks already use.
+    """
+    await players.ensure_fresh()
+    lid = settings.league_id_for(league)
+    state, fetched, users, rosters = await asyncio.gather(
+        client.nfl_state(), client.league(lid), client.users(lid), client.rosters(lid)
+    )
+    teams = services.build_teams(users, rosters)
+    match = _match_team_or_404(teams, manager)
+    raw_roster = next(
+        (r for r in rosters if r.get("roster_id") == match["roster_id"]), {}
+    )
+    roster_positions = fetched.get("roster_positions") or []
+    resolved_team = services.resolve_roster(raw_roster, match, roster_positions, players)
+
+    target_week = week or services.current_week(state)
+    season = services._season_number(state, fetched)
+    my_players = players.resolve_many([str(pid) for pid in (raw_roster.get("players") or [])])
+    my_teams = {p["nfl_team"] for p in my_players if p.get("nfl_team")}
+
+    async def _injury_disagreements() -> Any:
+        checks = await asyncio.gather(
+            *[public.get(f"/injury-report/{p['player_id']}") for p in my_players],
+            return_exceptions=True,
+        )
+        disagreements = []
+        for report in checks:
+            if isinstance(report, BaseException) or not report.get("listed"):
+                continue
+            espn_status = (report.get("espn_report") or {}).get("status")
+            sleeper_status = report.get("sleeper_injury_status")
+            if espn_status and espn_status != sleeper_status:
+                disagreements.append(report)
+        return disagreements
+
+    async def _upcoming_byes() -> Any:
+        if not season:
+            return {"error": "Current season could not be determined."}
+        byes = (await public.get(f"/byes/{season}")).get("byes") or {}
+        soon = [target_week + n for n in range(2)]
+        return [
+            {
+                "name": p["name"],
+                "position": p.get("position"),
+                "nfl_team": p["nfl_team"],
+                "bye_week": byes[p["nfl_team"]],
+            }
+            for p in my_players
+            if p.get("nfl_team") and byes.get(p["nfl_team"]) in soon
+        ]
+
+    async def _weather_concerns() -> Any:
+        weather = await public.get(f"/weather/{target_week}", params={"season": season})
+        if not weather.get("available"):
+            return {"error": weather.get("error", "Weather not available for this week.")}
+        return [
+            g
+            for g in weather.get("outdoor_games_with_concerns") or []
+            if g.get("home_team") in my_teams or g.get("away_team") in my_teams
+        ]
+
+    injury_disagreements, upcoming_byes, weather_concerns, available = await asyncio.gather(
+        _guarded(_injury_disagreements()),
+        _guarded(_upcoming_byes()),
+        _guarded(_weather_concerns()),
+        available_players(league=league, position=None, limit=3, season=season),
+    )
+
+    thin_positions = [
+        b for b in positional_balance(resolved_team, roster_positions) if b["spare"] <= 0
+    ]
+    trending_free_agents = {
+        position: [
+            {"name": c["name"], "recent_average_points": c["recent_average_points"]}
+            for c in candidates
+        ]
+        for position, candidates in (available.get("available") or {}).items()
+        if candidates
+    }
+
+    return {
+        "matched_on": manager,
+        "week": target_week,
+        "injury_disagreements": injury_disagreements,
+        "upcoming_byes": upcoming_byes,
+        "thin_positions": thin_positions,
+        "trending_free_agents": trending_free_agents,
+        "weather_concerns": weather_concerns,
+    }
+
+
+async def _guarded(coro: Any) -> Any:
+    """Run one briefing block, reporting its own failure instead of failing
+    the whole briefing - the same contract /snapshot's ?include= blocks use."""
+    try:
+        return await coro
+    except HTTPException as exc:
+        return {"error": str(exc.detail)}
+
+
 @app.post(
     "/leagues/{league}/decision",
     tags=["edge"],
