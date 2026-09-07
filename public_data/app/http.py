@@ -34,6 +34,7 @@ async def request_json(
     *,
     source: str,
     params: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
     timeout: float | None = None,
     max_retries: int = 3,
     allow_404: bool = False,
@@ -43,7 +44,7 @@ async def request_json(
 
     for attempt in range(1, max(1, max_retries) + 1):
         try:
-            response = await client.get(url, params=params, timeout=timeout)
+            response = await client.get(url, params=params, headers=headers, timeout=timeout)
         except httpx.TimeoutException as exc:
             last_error = exc
             log.warning("[%s] timeout calling %s (attempt %s)", source, url, attempt)
@@ -60,7 +61,10 @@ async def request_json(
                     status_code=502,
                     detail=(
                         f"{source} rejected the request ({response.status_code}). "
-                        "Check the API key for that source."
+                        "If this source needs an API key, check it; otherwise the "
+                        "source is likely flagging the request as automated (a "
+                        "missing or non-browser User-Agent is the usual cause for "
+                        "an unofficial API like ESPN's)."
                     ),
                 )
             if response.status_code in RETRY_STATUS:

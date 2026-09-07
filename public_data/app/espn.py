@@ -38,6 +38,19 @@ PRACTICE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("full", re.compile(r"\bfull (?:participant|practice|go)\b", re.I)),
 )
 
+# ESPN's site API is unofficial and appears to reject requests carrying an
+# obviously non-browser User-Agent (this app's own default is a clearly
+# labelled bot string, which is honest but got a live 403 from ESPN
+# specifically - Sleeper, nflverse, The Odds API and Open-Meteo have all been
+# fine with it). A realistic browser UA only for these calls is the practical
+# fix; every other source keeps the honest one.
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+}
+
 STATUS_NORMALISATION = {
     "out": "Out",
     "doubtful": "Doubtful",
@@ -106,6 +119,7 @@ class EspnProvider:
             f"{self._base_url}/scoreboard",
             source="ESPN",
             params=params,
+            headers=_BROWSER_HEADERS,
             timeout=self._settings.http_timeout,
             max_retries=self._settings.http_max_retries,
             allow_404=True,
@@ -120,6 +134,7 @@ class EspnProvider:
             self._client,
             f"{self._base_url}/teams/{slug}/injuries",
             source="ESPN",
+            headers=_BROWSER_HEADERS,
             timeout=self._settings.http_timeout,
             max_retries=self._settings.http_max_retries,
             allow_404=True,
