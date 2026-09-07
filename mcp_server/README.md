@@ -122,16 +122,19 @@ public URL instead — it works, it just sends the traffic out and back.
 
 ## The tools
 
-23 tools, one per backend endpoint. `/docs` is not exposed — it is only the OpenAPI
+30 tools, one per backend endpoint. `/docs` is not exposed — it is only the OpenAPI
 reference and nothing useful to a model.
 
 ### League
 
 | Tool | What it does |
 | --- | --- |
+| `league_list` | The leagues this backend serves. Call this first if a `league` slug is unknown. |
 | `league_snapshot` | The whole league: teams, rosters split into starters/bench/IR, standings, matchups and transactions, with player names resolved. The starting point for most questions. |
 | `league_settings` | Scoring, lineup slots, playoff format, trade deadline and waiver rules in plain language. |
 | `league_roster` | One team's roster. Flexible search across username, display name and team name. |
+| `waivers_available` | Free agents ranked by recent role trend and points under this league's own scoring rules. |
+| `schedule_difficulty` | For a roster's skill players, how stingy their next few opponents have been at that position. |
 
 ### External sources
 
@@ -151,6 +154,10 @@ reference and nothing useful to a model.
 | `manager_list` | Every manager's FAAB habits, activity, draft tendencies and trade history, across every archived season. |
 | `manager_profile` | One manager, read against the field. |
 | `manager_pressure` | Which teams are forced to act — bye collisions, stacked injuries, no cover. |
+| `manager_playoff_odds` | Monte Carlo playoff odds per team from its own scoring history, plus a buyer/bubble/seller read. |
+| `manager_trade_fits` | Your thin positions crossed against every other team's surplus there, weighted by playoff odds and trade history. |
+| `manager_faab_bid` | A bid recommendation anchored to the league's own bidding history and remaining budgets. |
+| `manager_briefing` | A weekly digest: injury disagreements, upcoming byes, thin positions, trending free agents and weather concerns. |
 | `decision_log` | Record a decision and its reasoning. Append-only. |
 | `decision_log_outcome` | Record how a logged decision turned out. Append-only. |
 | `decision_list` | Read the decision log with outcomes. |
@@ -227,7 +234,7 @@ propagation, the token path, and the Host header check.
 ## Project layout
 
 ```
-server.py            The MCP server: 23 tools, annotations, transport wiring
+server.py            The MCP server: 30 tools, annotations, transport wiring
 backend.py           HTTP client for the REST backend; holds BACKEND_API_KEY
 entrypoint.py        Binds the platform's PORT, and IPv6 for private networking
 railway.json         Railway build and healthcheck config

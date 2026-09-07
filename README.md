@@ -78,6 +78,9 @@ resolution, the external sources, the draft board) and stay at a plain path.
 | `GET` | `/injury-report/{player_id}` | `player_id` | ESPN for one player, next to what Sleeper has cached, so you can see when they disagree. |
 | `GET` | `/weather/{week}` | `week`, `season` | Open-Meteo: forecast at the kickoff hour per stadium. Domes return `indoor: true` without any API call. |
 | `GET` | `/stadiums` | — | The static reference: coordinates and roof type for all 32 stadiums. |
+| `POST` | `/position-points/{position}` | `position`, `season`; body `scoring_settings` **(required)** | Every player at a position, scored week by week under a league's own rules instead of nflverse's fixed PPR column. |
+| `POST` | `/points-allowed/{position}` | `position`, `season`; body `scoring_settings` **(required)** | Every NFL defense's fantasy points allowed to a position - strength of schedule for a fantasy roster, not a real-world defensive rank. |
+| `GET` | `/schedule/{season}` | `season` | Every team's opponent, week by week - pairs with `/points-allowed` for a per-player schedule-difficulty view. |
 
 Every endpoint in this table is a thin proxy to the shared `public_data/` service (see
 [Architecture](#architecture-three-services-not-one)) - same path, same params, same
@@ -90,6 +93,12 @@ response, computed once there and reused by every league.
 | `GET` | `/leagues/{league}/managers` | `seasons`, `days` | Every manager's profile: FAAB behaviour (typical bid, max ever, win rate on contested claims), which day they move, activity, draft tendencies by position and round, trade partners. Plus `league_context` to read one against the field. |
 | `GET` | `/leagues/{league}/manager/{name}` | `name`, `seasons`, `days` | One manager, with the league context. |
 | `GET` | `/leagues/{league}/pressure` | `week`, `horizon=3` | Who is forced to act: bye-week collisions, stacked injuries, positions with no cover. Ranked by urgency. |
+| `GET` | `/leagues/{league}/available` | `position`, `limit=25`, `season` | Free agents ranked by recent role trend and points under this league's own `scoring_settings` - not nflverse's generic PPR column. |
+| `GET` | `/leagues/{league}/schedule-difficulty/{manager}` | `manager`, `weeks_ahead=4`, `season` | For each of a roster's QB/RB/WR/TE, how many fantasy points its next opponents have allowed at that position. |
+| `GET` | `/leagues/{league}/playoff-odds` | `trials=3000` | Monte Carlo playoff odds per team from each team's own scoring history, plus a buyer/bubble/seller read. |
+| `GET` | `/leagues/{league}/trade-fits/{manager}` | `manager` | Your thin positions crossed against every other team's surplus there, weighted by their playoff odds and trade history with you. |
+| `GET` | `/leagues/{league}/faab-bid/{manager}` | `manager`, `player_id`, `confidence=medium` | A bid recommendation anchored to the league's own bidding history and remaining budgets. |
+| `GET` | `/leagues/{league}/briefing/{manager}` | `manager`, `week` | One weekly digest: injury disagreements, upcoming byes, thin positions, trending free agents and weather concerns for your roster. |
 | `POST` | `/leagues/{league}/decision` | `kind`, `summary` **(required)**; `reasoning`, `players_involved`, `confidence`, `expected`, `week`, `season` | Log a decision and its reasoning, at the moment you make it. |
 | `POST` | `/leagues/{league}/decision/{decision_id}/outcome` | `decision_id`, `outcome` **(required)**; `season` | Record how it turned out. Appended, never edited — the original reasoning stays intact. |
 | `GET` | `/leagues/{league}/decisions` | `season`, `week`, `kind`, `pending_only=false` | Read the decision log with outcomes. |
@@ -464,7 +473,7 @@ Everyone in the league can ask an AI about players. Stats, projections and ranki
 table stakes — public, aggregated, and available to all twelve of you. An edge has to
 come from something the others structurally cannot get.
 
-Three things qualify, and all three are built here.
+All of what follows is built here, none of it public.
 
 **Be honest about the size of it.** Fantasy football is dominated by variance and draft
 luck. None of this wins you the league. What it does is tilt marginal decisions — how
@@ -532,6 +541,65 @@ Two details that keep the score meaningful:
 Bye weeks are derived from the nflverse schedule: a team's bye is the regular-season week
 it does not appear in. Verified for 2026 — all 32 teams resolve, one bye each.
 
+### `GET /leagues/{league}/available` — the waiver wire, in this league's own scoring
+
+A general fantasy tool ranks free agents against a generic scoring system, not against
+who is actually still on your waiver wire. This computes fantasy points from nflverse's
+raw stat counts under **this league's own `scoring_settings`** (see
+[`app/scoring.py`](public_data/app/scoring.py) in the public-data service) — 0.5 PPR and
+6-point passing touchdowns score differently than someone else's league, and a generic
+top-100 list cannot tell the difference. Excludes anyone already rostered anywhere in the
+league and ranks by recent-role trend so a role change surfaces before the box score
+catches up.
+
+Only offense skill positions (QB/RB/WR/TE) are scored this way — kicking, IDP and defense
+scoring keys have no equivalent raw stat in nflverse's weekly file, and rather than
+silently ignore them the response says so in `scoring_not_applied`.
+
+### `GET /leagues/{league}/schedule-difficulty/{manager}` — whose slate is softer
+
+For each of a roster's skill players, how many fantasy points its next few opponents have
+actually allowed at that position this season — not the opponent's real-world defensive
+rank, which does not distinguish "bad against the run" from "bad against pass-catching
+backs specifically". The tiebreaker in a close start/sit or a trade-value argument between
+two similar players.
+
+### `GET /leagues/{league}/playoff-odds` — Monte Carlo odds and a buy/sell read
+
+Simulates the rest of the regular season thousands of times from each team's own scoring
+history (its own mean and spread of points_for so far — not a projection system, not
+opponent-specific) to estimate each team's odds of making the playoffs, then classifies
+each as a `buyer`, `bubble` or `seller`. A raw win-loss record does not say whether a team
+is safely in or needs a miracle; this does. See
+[`app/playoffs.py`](app/playoffs.py) for exactly what it does and does not model — it is
+deliberately upfront that 12-14 games of history is not enough for more precision than
+this.
+
+### `GET /leagues/{league}/trade-fits/{manager}` — who actually has what you need
+
+Crosses your thin positions (no spare healthy body beyond your starters — the same read
+`/pressure` uses, via `positional_balance()`, which unlike `thin_positions` also reports
+genuine *surplus*) against every other team's surplus at that position, weighted by their
+playoff odds and how often they have actually traded with you before. A seller with a
+surplus at your weak spot is a far better target than a buyer sitting on the same surplus
+as insurance.
+
+### `GET /leagues/{league}/faab-bid/{manager}` — what it actually takes to win a bid
+
+Anchors a bid recommendation to the single most dangerous rival — the manager with both a
+track record of bidding high and enough budget left to do it again — rather than a generic
+"bid $X for a WR2" rule. `confidence=low/medium/high` scales the margin over that rival's
+past ceiling. Honest about its blind spot: there is no signal here about who else actually
+wants this specific player, only about what the field has done before.
+
+### `GET /leagues/{league}/briefing/{manager}` — the weekly digest
+
+Merges five otherwise-separate calls — injury disagreements between ESPN and Sleeper,
+byes in the next two weeks, thin positions, the top trending free agents, and weather
+concerns for your players' games — into one read for your own roster. Same failure
+contract as `/snapshot`'s `?include=` blocks: a source that fails reports its own error
+rather than failing the whole briefing.
+
 ### `POST /leagues/{league}/decision` and `GET /leagues/{league}/decisions` — your own calibration
 
 Log what you decided and why, at the moment you decide it, before you know how it went.
@@ -551,10 +619,10 @@ made, which is the part that matters when you go back to check your reasoning ag
 what happened. `GET /leagues/{league}/decisions?pending_only=true` lists calls still
 awaiting an outcome.
 
-This is the slowest of the three to pay off and the only one that compounds across
-seasons: two years of these is the only way to find out whether you systematically
-overpay on waivers, or whether your close start/sit calls are coin flips. No public tool
-can tell you, because none of them knows what you decided or why.
+This is the slowest of everything on this page to pay off, and the only one that
+compounds across seasons: two years of these is the only way to find out whether you
+systematically overpay on waivers, or whether your close start/sit calls are coin flips.
+No public tool can tell you, because none of them knows what you decided or why.
 
 ## Keeping history
 
@@ -1080,7 +1148,7 @@ docker-compose.yml      Brings up all three together, for local development
 `mcp_server/` is a separate service that wraps the league backend as an
 [MCP](https://modelcontextprotocol.io) server, so every league the backend serves can be
 added to Claude.ai through **one** remote custom connector (Customize → Connectors → Add
-custom connector). It exposes 24 tools over Streamable HTTP and keeps `API_KEY` on the
+custom connector). It exposes 30 tools over Streamable HTTP and keeps `API_KEY` on the
 server side so the Claude client never sees it; every league-specific tool takes a
 `league` slug argument (`league_list` shows what is available), with `DEFAULT_LEAGUE`
 available to skip passing it when the connector is used for one league day to day. Adding
