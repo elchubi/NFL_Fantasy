@@ -718,8 +718,14 @@ different root directory:
 
 | Service | Root Directory | Domain | Healthcheck |
 | --- | --- | --- | --- |
-| the REST backend | `/` | `api.tudominio.com` | `/health` |
+| the REST backend | `/` | **none** — private only | `/health` |
 | the MCP server | `/mcp_server` | `mcp.tudominio.com` | `/healthz` |
+
+**The backend does not need a public domain.** Only the MCP server has to be reachable
+from the internet, since that is the one Claude.ai connects to. The backend is reached
+exclusively over Railway's private network, from the MCP service and nowhere else. This
+is the recommended setup, not just an option — it means the league data and the backend's
+`API_KEY` are never exposed to the public internet at all.
 
 They build and redeploy independently. `docker-compose.yml` is **ignored by Railway** —
 it stays for local development. Each root has a `railway.json` that pins the Dockerfile
@@ -743,13 +749,15 @@ builder and the healthcheck path.
    recoverable — and `league.db` is **destroyed on every deploy**. The transactions and
    draft picks in it can be re-fetched with `/backfill`, but the archived betting lines
    and injury reports cannot be re-fetched from anywhere.
-6. **Networking**: generate a domain, or a public one only if you want to call the API
-   directly. The MCP server can reach it privately without one.
+6. **Networking**: do **not** generate a domain. Leave it private. Railway's healthcheck
+   (`railway.json`'s `healthcheckPath`) runs against the container directly and does not
+   need one; the MCP service reaches it over `RAILWAY_PRIVATE_DOMAIN` (below).
 7. **After the first deploy**, run the backfill once so manager profiling can see past
-   seasons:
-   ```bash
-   curl -X POST -H "X-API-Key: $API_KEY" https://api.tudominio.com/backfill
-   ```
+   seasons. With no public domain there is nothing to `curl` from your machine, so do it
+   through the MCP connector instead, once it is deployed and added to Claude.ai — ask
+   Claude to call the `history_backfill` tool. (If you want to test the backend on its
+   own before wiring up the MCP service, generate a domain temporarily, run the curl, then
+   remove the domain again.)
 
 ### 2. The MCP service
 
@@ -757,14 +765,23 @@ builder and the healthcheck path.
 2. **Settings → Source → Root Directory**: `/mcp_server`
 3. **Watch Paths**: `/mcp_server/**`
 4. **Variables**:
-   - `BACKEND_URL` = `http://${{backend.RAILWAY_PRIVATE_DOMAIN}}:${{backend.PORT}}`
-     (substitute your backend service's name), or its public URL
+   - `BACKEND_URL` = `http://${{backend.RAILWAY_PRIVATE_DOMAIN}}:${{backend.PORT}}` —
+     substitute your backend service's actual name for `backend`. This is what keeps the
+     backend off the public internet entirely; traffic never leaves Railway's network.
    - `BACKEND_API_KEY` = `${{backend.API_KEY}}` — a reference variable, so rotating the
      key on the backend updates both
    - `MCP_URL_TOKEN` — `python -c "import secrets; print(secrets.token_urlsafe(32))"`
    - `MCP_ALLOWED_HOSTS` = your MCP domain
-5. **Networking**: generate a public domain. Claude.ai connects from Anthropic's
-   infrastructure, so this one has to be publicly reachable.
+5. **Networking**: generate a public domain **for this service only**. Claude.ai connects
+   from Anthropic's infrastructure, so the MCP server has to be reachable from the
+   internet — that requirement does not extend to the backend.
+
+> `${{backend.RAILWAY_PRIVATE_DOMAIN}}` and `${{backend.PORT}}` are Railway reference
+> variables, resolved from the other service's own variables. This is standard Railway
+> behavior but was not verified against a live deployment while writing this, since
+> Railway's own docs were unreachable from the build environment — if either fails to
+> resolve, check the exact variable names in your backend service's **Variables** tab
+> under **Shared Variables** / the service's own reference name.
 
 ### Two things Railway does differently
 
@@ -780,15 +797,24 @@ in both places. `HOST` overrides the detection if you need it to.
 
 ### Verifying
 
+With no public domain on the backend, its own health is checked two ways:
+
+- **Railway's dashboard** — the backend's deployment shows healthy/unhealthy from
+  `railway.json`'s `healthcheckPath`, checked against the container directly over
+  Railway's internal network. No domain involved.
+- **The `health_check` MCP tool** — proves the whole chain: Claude.ai → MCP service →
+  private network → backend. This is the check that actually matters, since it is the
+  same path every other tool call takes.
+
 ```bash
-curl https://api.tudominio.com/health
 curl https://mcp.tudominio.com/healthz
 ```
 
-The MCP server's `/healthz` reports the backend URL it is pointed at and whether the key
-is configured, but deliberately does **not** call the backend, so it stays green if the
-backend is down. Use the `health_check` tool for that — it is the one that proves the two
-services can actually talk.
+`/healthz` is the MCP server's own liveness — it reports the backend URL it is pointed at
+and whether the key is configured, but deliberately does **not** call the backend, so it
+stays green even if the backend is down. That is intentional: Railway's platform-level
+healthcheck should reflect this service's own process, not a dependency it cannot fix by
+restarting. Use `health_check` (the tool, through Claude) for the end-to-end check.
 
 ### Running it locally
 
