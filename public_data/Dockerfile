@@ -23,7 +23,10 @@ RUN useradd --create-home --uid 10001 appuser \
     && chown -R appuser:appuser /data /app
 USER appuser
 
-VOLUME ["/data"]
+# No VOLUME instruction: Railway rejects it at build time ("use Railway
+# Volumes" instead) and Docker Compose doesn't need it either - the named
+# volume in docker-compose.yml and the Railway Volume mounted from its UI
+# both just bind-mount over /data without the image declaring it.
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
