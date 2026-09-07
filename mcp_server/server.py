@@ -288,6 +288,29 @@ async def schedule_difficulty(
     )
 
 
+@mcp.tool(
+    name="manager_schedule",
+    annotations=READ_ONLY,
+    description=(
+        "Who a manager plays every week of the regular season, from Sleeper's own "
+        "pre-generated pairing - future weeks included, not just ones already "
+        "played. This is the pairing only, not a strength read: cross it with "
+        "manager_playoff_odds yourself once there are a few weeks of real results "
+        "to judge an opponent by, since week-1-ish odds are close to a coin flip "
+        "for everyone and not worth reading into yet."
+    ),
+)
+async def manager_schedule(manager: str, league: str | None = None) -> Any:
+    """
+    Args:
+        manager: Username, display name or team name. Partial matches are fine.
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
+    """
+    lid = _resolve_league(league)
+    return await _get(f"/leagues/{lid}/schedule/{manager}")
+
+
 # --- External sources ---------------------------------------------------------
 
 
@@ -911,7 +934,7 @@ async def healthz(request: Any) -> JSONResponse:
 TOOL_NAMES = [
     "league_list",
     "league_snapshot", "league_settings", "league_roster", "waivers_available",
-    "schedule_difficulty",
+    "schedule_difficulty", "manager_schedule",
     "stats_advanced", "stats_odds", "stats_injury_report_team",
     "stats_injury_report_player", "stats_weather", "stats_stadiums",
     "manager_list", "manager_profile", "manager_pressure", "manager_playoff_odds",

@@ -464,6 +464,69 @@ async def schedule_difficulty(
 
 
 @app.get(
+    "/leagues/{league}/schedule/{manager}",
+    tags=["edge"],
+    dependencies=[Depends(require_api_key)],
+    summary="One manager's opponent for every remaining regular-season week",
+)
+async def manager_schedule(
+    league: str = Path(description="A slug from GET /leagues."),
+    manager: str = Path(description="Username, display name or team name."),
+) -> dict[str, Any]:
+    """Who `manager` plays each week of the regular season, from Sleeper's own
+    pre-generated pairing (available for future weeks too, not just ones
+    already played - the same mechanism /playoff-odds uses to simulate the
+    rest of the season).
+
+    This is the pairing only, not a strength read - a team's record and
+    playoff odds mean little before real games have been played, so cross
+    this with /playoff-odds yourself once there is a few weeks of results to
+    judge an opponent by, rather than trusting week-1 odds that are close to
+    a coin flip for everyone.
+    """
+    lid = settings.league_id_for(league)
+    fetched, users, rosters = await asyncio.gather(
+        client.league(lid), client.users(lid), client.rosters(lid)
+    )
+    teams = services.build_teams(users, rosters)
+    match = _match_team_or_404(teams, manager)
+
+    playoff_start = int((fetched.get("settings") or {}).get("playoff_week_start") or 15)
+    weeks = list(range(1, playoff_start))
+    pages = await asyncio.gather(*[client.matchups(lid, w) for w in weeks])
+
+    schedule = []
+    for week, rows in zip(weeks, pages):
+        mine = next((r for r in rows if r.get("roster_id") == match["roster_id"]), None)
+        matchup_id = mine.get("matchup_id") if mine else None
+        opponent_row = next(
+            (
+                r
+                for r in rows
+                if r.get("matchup_id") == matchup_id and r.get("roster_id") != match["roster_id"]
+            ),
+            None,
+        ) if matchup_id is not None else None
+
+        schedule.append(
+            {
+                "week": week,
+                "bye": opponent_row is None,
+                "opponent": services.team_label(teams, opponent_row["roster_id"])
+                if opponent_row
+                else None,
+            }
+        )
+
+    return {
+        "matched_on": manager,
+        "team": services.team_label(teams, match["roster_id"]),
+        "playoff_week_start": playoff_start,
+        "schedule": schedule,
+    }
+
+
+@app.get(
     "/advanced-stats/{player_id}",
     tags=["external"],
     dependencies=[Depends(require_api_key)],

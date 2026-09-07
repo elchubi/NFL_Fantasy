@@ -129,7 +129,7 @@ public URL instead — it works, it just sends the traffic out and back.
 
 ## The tools
 
-30 tools, one per backend endpoint. `/docs` is not exposed — it is only the OpenAPI
+31 tools, one per backend endpoint. `/docs` is not exposed — it is only the OpenAPI
 reference and nothing useful to a model.
 
 ### League
@@ -142,6 +142,7 @@ reference and nothing useful to a model.
 | `league_roster` | One team's roster. Flexible search across username, display name and team name. |
 | `waivers_available` | Free agents ranked by recent role trend and points under this league's own scoring rules. |
 | `schedule_difficulty` | For a roster's skill players, how stingy their next few opponents have been at that position. |
+| `manager_schedule` | Who a manager plays every week of the regular season - the fantasy matchup pairing itself, not a strength read. |
 
 ### External sources
 
@@ -241,7 +242,7 @@ propagation, the token path, and the Host header check.
 ## Project layout
 
 ```
-server.py            The MCP server: 30 tools, annotations, transport wiring
+server.py            The MCP server: 31 tools, annotations, transport wiring
 backend.py           HTTP client for the REST backend; holds BACKEND_API_KEY
 entrypoint.py        Binds the platform's PORT, and IPv6 for private networking
 railway.json         Railway build and healthcheck config

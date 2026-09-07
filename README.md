@@ -95,6 +95,7 @@ response, computed once there and reused by every league.
 | `GET` | `/leagues/{league}/pressure` | `week`, `horizon=3` | Who is forced to act: bye-week collisions, stacked injuries, positions with no cover. Ranked by urgency. |
 | `GET` | `/leagues/{league}/available` | `position`, `limit=25`, `season` | Free agents ranked by recent role trend and points under this league's own `scoring_settings` - not nflverse's generic PPR column. |
 | `GET` | `/leagues/{league}/schedule-difficulty/{manager}` | `manager`, `weeks_ahead=4`, `season` | For each of a roster's QB/RB/WR/TE, how many fantasy points its next opponents have allowed at that position. |
+| `GET` | `/leagues/{league}/schedule/{manager}` | `manager` | Who `manager` plays every week of the regular season - the pairing only, from Sleeper's own pre-generated schedule (future weeks included). Not a strength read; cross with `/playoff-odds` yourself once there are real results. |
 | `GET` | `/leagues/{league}/playoff-odds` | `trials=3000` | Monte Carlo playoff odds per team from each team's own scoring history, plus a buyer/bubble/seller read. |
 | `GET` | `/leagues/{league}/trade-fits/{manager}` | `manager` | Your thin positions crossed against every other team's surplus there, weighted by their playoff odds and trade history with you. |
 | `GET` | `/leagues/{league}/faab-bid/{manager}` | `manager`, `player_id`, `confidence=medium` | A bid recommendation anchored to the league's own bidding history and remaining budgets. |
@@ -1223,7 +1224,7 @@ docker-compose.yml      Brings up all three together, for local development
 `mcp_server/` is a separate service that wraps the league backend as an
 [MCP](https://modelcontextprotocol.io) server, so every league the backend serves can be
 added to Claude.ai through **one** remote custom connector (Customize → Connectors → Add
-custom connector). It exposes 30 tools over Streamable HTTP and keeps `API_KEY` on the
+custom connector). It exposes 31 tools over Streamable HTTP and keeps `API_KEY` on the
 server side so the Claude client never sees it; every league-specific tool takes a
 `league` slug argument (`league_list` shows what is available), with `DEFAULT_LEAGUE`
 available to skip passing it when the connector is used for one league day to day. Adding
