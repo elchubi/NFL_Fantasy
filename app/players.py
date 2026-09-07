@@ -23,8 +23,15 @@ from app.sleeper import SleeperClient
 
 log = logging.getLogger(__name__)
 
+# Bumped whenever _KEEP_FIELDS changes, so an older cache file on disk is
+# refetched instead of being served without the newer fields.
+CACHE_SCHEMA_VERSION = 2
+
 # Fields worth keeping from each Sleeper player record.
 _KEEP_FIELDS = (
+    # Cross-source join keys: gsis_id reaches nflverse, espn_id reaches ESPN.
+    "gsis_id",
+    "espn_id",
     "first_name",
     "last_name",
     "full_name",
@@ -63,8 +70,22 @@ class PlayerStore:
         self._path = Path(settings.players_cache_path)
         self._ttl_seconds = settings.players_cache_ttl_hours * 3600
         self._players: dict[str, dict[str, Any]] = {}
+        self._by_gsis: dict[str, str] = {}
+        self._by_espn: dict[str, str] = {}
         self._fetched_at: float = 0.0
         self._lock = asyncio.Lock()
+
+    def _reindex(self) -> None:
+        """Index Sleeper ids by the ids the other data sources use."""
+        self._by_gsis = {}
+        self._by_espn = {}
+        for pid, raw in self._players.items():
+            gsis = raw.get("gsis_id")
+            if gsis:
+                self._by_gsis[str(gsis)] = pid
+            espn = raw.get("espn_id")
+            if espn:
+                self._by_espn[str(espn)] = pid
 
     # --- Cache state ----------------------------------------------------------
 
@@ -108,11 +129,19 @@ class PlayerStore:
         try:
             with self._path.open("r", encoding="utf-8") as fh:
                 payload = json.load(fh)
+            if payload.get("schema_version") != CACHE_SCHEMA_VERSION:
+                log.info(
+                    "Player cache schema changed (%s -> %s); refetching.",
+                    payload.get("schema_version"),
+                    CACHE_SCHEMA_VERSION,
+                )
+                return False
             players = payload["players"]
             if not isinstance(players, dict) or not players:
                 raise ValueError("empty player map")
             self._players = players
             self._fetched_at = float(payload.get("fetched_at") or 0.0)
+            self._reindex()
         except FileNotFoundError:
             log.info("No player cache at %s yet.", self._path)
             return False
@@ -131,7 +160,14 @@ class PlayerStore:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._path.with_suffix(self._path.suffix + ".tmp")
             with tmp.open("w", encoding="utf-8") as fh:
-                json.dump({"fetched_at": self._fetched_at, "players": self._players}, fh)
+                json.dump(
+                    {
+                        "schema_version": CACHE_SCHEMA_VERSION,
+                        "fetched_at": self._fetched_at,
+                        "players": self._players,
+                    },
+                    fh,
+                )
             tmp.replace(self._path)
         except OSError as exc:  # A read-only volume shouldn't take the API down.
             log.warning("Could not write player cache to %s: %s", self._path, exc)
@@ -173,6 +209,7 @@ class PlayerStore:
                 if isinstance(data, dict)
             }
             self._fetched_at = time.time()
+            self._reindex()
             self._save_to_disk()
             log.info("Cached %s players.", len(self._players))
 
@@ -215,3 +252,37 @@ class PlayerStore:
         if not player_ids:
             return []
         return [self.resolve(pid) for pid in player_ids if pid not in (None, "0", 0)]
+
+    # --- Cross-source ids -----------------------------------------------------
+
+    def raw(self, player_id: Any) -> dict[str, Any] | None:
+        return self._players.get(str(player_id))
+
+    def gsis_id(self, player_id: Any) -> str | None:
+        """nflverse keys everything by gsis_id; Sleeper carries it per player."""
+        raw = self._players.get(str(player_id))
+        return str(raw["gsis_id"]) if raw and raw.get("gsis_id") else None
+
+    def espn_id(self, player_id: Any) -> str | None:
+        raw = self._players.get(str(player_id))
+        return str(raw["espn_id"]) if raw and raw.get("espn_id") else None
+
+    def sleeper_id_for_gsis(self, gsis_id: str) -> str | None:
+        return self._by_gsis.get(str(gsis_id))
+
+    def sleeper_id_for_espn(self, espn_id: Any) -> str | None:
+        return self._by_espn.get(str(espn_id))
+
+    def find_by_name(self, name: str, team: str | None = None) -> str | None:
+        """Last-resort lookup when a source gives no usable id, only a name."""
+        needle = " ".join(str(name).lower().split())
+        if not needle:
+            return None
+        fallback = None
+        for pid, raw in self._players.items():
+            if " ".join(str(raw.get("full_name", "")).lower().split()) != needle:
+                continue
+            if team and raw.get("team") and str(raw["team"]).upper() == str(team).upper():
+                return pid
+            fallback = fallback or pid
+        return fallback

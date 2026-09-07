@@ -11,7 +11,16 @@ services:
       API_KEY: ${API_KEY:?set API_KEY in your .env}
       # Optional (defaults shown)
       PLAYERS_CACHE_PATH: /data/players_cache.json
+      CACHE_DIR: /data
       PLAYERS_CACHE_TTL_HOURS: ${PLAYERS_CACHE_TTL_HOURS:-20}
+      # External sources. Only The Odds API needs a key; without it /odds
+      # returns 503 and everything else keeps working.
+      ODDS_API_KEY: ${ODDS_API_KEY:-}
+      ODDS_CACHE_TTL_HOURS: ${ODDS_CACHE_TTL_HOURS:-24}
+      NFLVERSE_CACHE_TTL_HOURS: ${NFLVERSE_CACHE_TTL_HOURS:-24}
+      NFLVERSE_INCLUDE_RED_ZONE: ${NFLVERSE_INCLUDE_RED_ZONE:-true}
+      ESPN_CACHE_TTL_HOURS: ${ESPN_CACHE_TTL_HOURS:-3}
+      WEATHER_CACHE_TTL_HOURS: ${WEATHER_CACHE_TTL_HOURS:-12}
       HTTP_TIMEOUT: ${HTTP_TIMEOUT:-20}
       PLAYERS_HTTP_TIMEOUT: ${PLAYERS_HTTP_TIMEOUT:-120}
       CORS_ORIGINS: ${CORS_ORIGINS:-*}
@@ -19,7 +28,8 @@ services:
     ports:
       - "${PORT:-8000}:8000"
     volumes:
-      # Keeps the ~5MB player file across restarts so Sleeper is only hit once a day.
+      # Keeps every source cache across restarts: the ~5MB Sleeper player file
+      # and the ~5MB nflverse aggregate, so neither is re-downloaded on deploy.
       - players-cache:/data
     healthcheck:
       test:

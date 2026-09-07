@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from app import humanize
+from app import enrichment, humanize
 from app.players import PlayerStore
 from app.sleeper import SleeperClient
 
@@ -495,6 +495,8 @@ async def build_snapshot(
     league_id: str,
     week: int | None,
     days: int,
+    includes: list[str] | None = None,
+    providers: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The whole league in one readable payload."""
     await players.ensure_fresh()
@@ -526,8 +528,9 @@ async def build_snapshot(
     ]
 
     flat_transactions = [tx for page in tx_pages for tx in page]
+    resolved_matchups = build_matchups(matchups_raw, teams, roster_positions, players)
 
-    return {
+    snapshot = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "league": {
             "league_id": league.get("league_id"),
@@ -546,7 +549,7 @@ async def build_snapshot(
         "week": target_week,
         "standings": _standings(teams),
         "teams": resolved_rosters,
-        "matchups": build_matchups(matchups_raw, teams, roster_positions, players),
+        "matchups": resolved_matchups,
         "transactions": {
             "days": days,
             "weeks_scanned": weeks,
@@ -556,6 +559,29 @@ async def build_snapshot(
         },
         "players_cache": players.status(),
     }
+
+    if includes and providers:
+        season = _season_number(state, league)
+        snapshot["external"] = await enrichment.build_blocks(
+            includes,
+            providers=providers,
+            players=players,
+            snapshot_teams=resolved_rosters,
+            week=target_week,
+            season=season,
+        )
+        snapshot["included_sources"] = includes
+
+    return snapshot
+
+
+def _season_number(state: dict[str, Any], league: dict[str, Any]) -> int | None:
+    for value in (state.get("season"), league.get("season")):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _standings(teams: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:

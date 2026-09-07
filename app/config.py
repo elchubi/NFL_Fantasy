@@ -18,6 +18,36 @@ class Settings(BaseSettings):
     players_cache_path: str = "data/players_cache.json"
     players_cache_ttl_hours: float = 20.0
 
+    # --- External data sources ------------------------------------------------
+    # Where the per-source cache files live (defaults sit next to the player
+    # cache so a single mounted volume covers all of them).
+    cache_dir: str = ""
+
+    # nflverse (github releases, no key required).
+    nflverse_base_url: str = "https://github.com/nflverse/nflverse-data/releases/download"
+    nflverse_cache_ttl_hours: float = 24.0
+    nflverse_download_timeout: float = 300.0
+    # The play-by-play file is ~98MB; it is the only source of red zone usage.
+    # Set to false to skip it and serve every other advanced stat.
+    nflverse_include_red_zone: bool = True
+
+    # The Odds API (free tier: ~500 requests/month, so cache hard).
+    odds_api_key: str = ""
+    odds_base_url: str = "https://api.the-odds-api.com/v4"
+    odds_cache_ttl_hours: float = 24.0
+    odds_regions: str = "us"
+    odds_bookmakers: str = ""
+
+    # ESPN (unofficial, no key). Injury news moves during the week.
+    espn_base_url: str = "https://site.api.espn.com/apis/site/v2/sports/football/nfl"
+    espn_cache_ttl_hours: float = 3.0
+
+    # Open-Meteo (no key).
+    weather_base_url: str = "https://api.open-meteo.com/v1/forecast"
+    weather_cache_ttl_hours: float = 12.0
+    # Closer to kickoff the forecast is worth refreshing more often.
+    weather_gameday_cache_ttl_hours: float = 1.0
+
     # HTTP.
     sleeper_base_url: str = "https://api.sleeper.app/v1"
     http_timeout: float = 20.0
@@ -30,6 +60,13 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    def cache_path(self, filename: str) -> str:
+        """Path for a source cache file, alongside the player cache by default."""
+        from pathlib import Path
+
+        base = Path(self.cache_dir) if self.cache_dir else Path(self.players_cache_path).parent
+        return str(base / filename)
 
 
 @lru_cache
