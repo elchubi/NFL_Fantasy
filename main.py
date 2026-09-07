@@ -24,6 +24,7 @@ from app.history import SOURCES as HISTORY_SOURCES
 from app.history import decision_row, outcome_row
 from app.managers import build_profiles
 from app.players import PlayerStore
+from app import playoffs
 from app.pressure import analyse_league
 from app.public_client import PublicDataClient
 from app.security import require_api_key
@@ -800,6 +801,105 @@ async def pressure(
         "season": season,
         "bye_weeks_known": bool(byes),
         **report,
+    }
+
+
+@app.get(
+    "/leagues/{league}/playoff-odds",
+    tags=["edge"],
+    dependencies=[Depends(require_api_key)],
+    summary="Monte Carlo playoff odds and a buy/sell read per team",
+)
+async def playoff_odds(
+    league: str = Path(description="A slug from GET /leagues."),
+    trials: int = Query(
+        default=3000, ge=100, le=20000, description="Simulated seasons to run."
+    ),
+) -> dict[str, Any]:
+    """Simulates the rest of the regular season from each team's own scoring
+    history (mean and spread of its own points_for so far - not a projection
+    system, not opponent-specific) to estimate each team's odds of making the
+    playoffs.
+
+    A team's odds cross with its roster to say something a raw record can't:
+    an 8-2 team already locked into the playoffs is a soft trade target for a
+    win-now player, while a 3-7 team with a strong roster and long playoff
+    odds should be selling. Treats the current week as still undecided, which
+    slightly understates a team whose current-week result has already landed
+    but not yet been read back from Sleeper.
+    """
+    lid = settings.league_id_for(league)
+    state, fetched, users, rosters = await asyncio.gather(
+        client.nfl_state(), client.league(lid), client.users(lid), client.rosters(lid)
+    )
+    teams = services.build_teams(users, rosters)
+    league_settings = fetched.get("settings") or {}
+    playoff_spots = int(league_settings.get("playoff_teams") or 6)
+    playoff_start = int(league_settings.get("playoff_week_start") or 15)
+    current = services.current_week(state)
+
+    weeks_played = list(range(1, current))
+    weeks_remaining = [w for w in range(current, playoff_start) if w >= 1]
+
+    history_pages, remaining_pages = await asyncio.gather(
+        asyncio.gather(*[client.matchups(lid, w) for w in weeks_played]),
+        asyncio.gather(*[client.matchups(lid, w) for w in weeks_remaining]),
+    )
+
+    weekly_scores: dict[int, list[float]] = {rid: [] for rid in teams}
+    for page in history_pages:
+        for entry in page:
+            rid = entry.get("roster_id")
+            points = entry.get("points")
+            if rid in weekly_scores and points:
+                weekly_scores[rid].append(float(points))
+
+    remaining_matchups: list[list[tuple[int, int]]] = []
+    for page in remaining_pages:
+        by_matchup: dict[Any, list[int]] = {}
+        for entry in page:
+            matchup_id = entry.get("matchup_id")
+            rid = entry.get("roster_id")
+            if matchup_id is not None and rid is not None:
+                by_matchup.setdefault(matchup_id, []).append(rid)
+        remaining_matchups.append(
+            [tuple(pair) for pair in by_matchup.values() if len(pair) == 2]
+        )
+
+    standings = {
+        rid: {
+            "wins": team["record"]["wins"],
+            "losses": team["record"]["losses"],
+            "points_for": team["record"]["points_for"],
+        }
+        for rid, team in teams.items()
+    }
+    profiles = playoffs.team_scoring_profiles(weekly_scores)
+    odds = playoffs.simulate_playoff_odds(
+        profiles, standings, remaining_matchups, playoff_spots, trials=trials
+    )
+
+    report = [
+        {
+            "roster_id": rid,
+            "display_name": team["display_name"],
+            "team_name": team["team_name"],
+            "record": team["record"],
+            "scoring_profile": profiles.get(rid),
+            "playoff_odds": odds.get(rid, 0.0),
+            "read": playoffs.classify(odds.get(rid, 0.0)),
+        }
+        for rid, team in teams.items()
+    ]
+    report.sort(key=lambda t: t["playoff_odds"], reverse=True)
+
+    return {
+        "current_week": current,
+        "playoff_week_start": playoff_start,
+        "playoff_spots": playoff_spots,
+        "weeks_simulated": weeks_remaining,
+        "trials": trials,
+        "teams": report,
     }
 
 

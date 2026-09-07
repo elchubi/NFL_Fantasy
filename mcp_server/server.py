@@ -477,6 +477,30 @@ async def manager_pressure(
 
 
 @mcp.tool(
+    name="manager_playoff_odds",
+    annotations=READ_ONLY,
+    description=(
+        "Monte Carlo playoff odds for every team, simulated from each team's own "
+        "scoring history (not a projection system), plus a buyer/bubble/seller "
+        "read per team. Cross this with manager_pressure or a roster before "
+        "proposing a trade: a team already locked into the playoffs is a soft "
+        "target for a win-now player; a team with long odds should be selling "
+        "its expiring value, whether it has noticed or not."
+    ),
+)
+async def manager_playoff_odds(league: str | None = None, trials: int = 3000) -> Any:
+    """
+    Args:
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
+        trials: Simulated seasons to run (100-20000). Higher is slower but
+            less noisy; the default is plenty for a single read.
+    """
+    lid = _resolve_league(league)
+    return await _get(f"/leagues/{lid}/playoff-odds", params={"trials": trials})
+
+
+@mcp.tool(
     name="decision_log",
     annotations=APPEND_ONLY,
     description=(
@@ -812,7 +836,7 @@ TOOL_NAMES = [
     "schedule_difficulty",
     "stats_advanced", "stats_odds", "stats_injury_report_team",
     "stats_injury_report_player", "stats_weather", "stats_stadiums",
-    "manager_list", "manager_profile", "manager_pressure",
+    "manager_list", "manager_profile", "manager_pressure", "manager_playoff_odds",
     "decision_log", "decision_log_outcome", "decision_list",
     "draft_class", "draft_prospect",
     "history_backfill", "history_seasons",
