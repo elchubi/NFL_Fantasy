@@ -228,6 +228,53 @@ async def league_roster(manager: str, league: str | None = None) -> Any:
 
 
 @mcp.tool(
+    name="league_draft_picks",
+    annotations=READ_ONLY,
+    description=(
+        "One manager's fantasy draft for this league, pick by pick - round, overall "
+        "pick number, and who they took, resolved to a name/position/NFL team. Same "
+        "underlying picks manager_list and manager_profile already roll up into "
+        "positions_taken and average_round_by_position, just not aggregated - use "
+        "this to see the actual picks rather than the summary. Not to be confused "
+        "with draft_class/draft_prospect, which are the real NFL rookie draft, not "
+        "this league's own startup/rookie draft."
+    ),
+)
+async def league_draft_picks(
+    manager: str, league: str | None = None, season: int | None = None
+) -> Any:
+    """
+    Args:
+        manager: Username, display name or team name. Partial matches are fine.
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
+        season: Defaults to the current season.
+    """
+    lid = _resolve_league(league)
+    return await _get(f"/leagues/{lid}/draft-picks/{manager}", params={"season": season})
+
+
+@mcp.tool(
+    name="league_draft_board",
+    annotations=READ_ONLY,
+    description=(
+        "This league's whole fantasy draft, every team, in overall pick order - the "
+        "same picks behind league_draft_picks and manager_list's draft aggregates, "
+        "laid out as the whole board instead of split per manager."
+    ),
+)
+async def league_draft_board(league: str | None = None, season: int | None = None) -> Any:
+    """
+    Args:
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
+        season: Defaults to the current season.
+    """
+    lid = _resolve_league(league)
+    return await _get(f"/leagues/{lid}/draft-board", params={"season": season})
+
+
+@mcp.tool(
     name="waivers_available",
     annotations=READ_ONLY,
     description=(
@@ -933,7 +980,9 @@ async def healthz(request: Any) -> JSONResponse:
 
 TOOL_NAMES = [
     "league_list",
-    "league_snapshot", "league_settings", "league_roster", "waivers_available",
+    "league_snapshot", "league_settings", "league_roster",
+    "league_draft_picks", "league_draft_board",
+    "waivers_available",
     "schedule_difficulty", "manager_schedule",
     "stats_advanced", "stats_odds", "stats_injury_report_team",
     "stats_injury_report_player", "stats_weather", "stats_stadiums",

@@ -1226,7 +1226,7 @@ docker-compose.yml      Brings up all three together, for local development
 `mcp_server/` is a separate service that wraps the league backend as an
 [MCP](https://modelcontextprotocol.io) server, so every league the backend serves can be
 added to Claude.ai through **one** remote custom connector (Customize → Connectors → Add
-custom connector). It exposes 31 tools over Streamable HTTP and keeps `API_KEY` on the
+custom connector). It exposes 33 tools over Streamable HTTP and keeps `API_KEY` on the
 server side so the Claude client never sees it; every league-specific tool takes a
 `league` slug argument (`league_list` shows what is available), with `DEFAULT_LEAGUE`
 available to skip passing it when the connector is used for one league day to day. Adding
