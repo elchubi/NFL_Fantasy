@@ -307,6 +307,45 @@ async def waivers_available(
 
 
 @mcp.tool(
+    name="players_compare",
+    annotations=READ_ONLY,
+    description=(
+        "Real production - games, season_total_points, season_average_points, "
+        "recent_average_points, all under this league's own scoring settings - for "
+        "any list of players, rostered or not. waivers_available only covers the "
+        "current free-agent pool, so it can't help with a trade evaluation (both "
+        "sides are rostered) or a live-draft comparison where some options are "
+        "already gone; this can. Pass player_ids, names, or both, up to 20 total. "
+        "A player that doesn't resolve, is an ambiguous name, or plays a position "
+        "with no production data (only QB/RB/WR/TE) is reported in `unresolved` "
+        "rather than failing the whole call."
+    ),
+)
+async def players_compare(
+    league: str | None = None,
+    player_ids: str | None = None,
+    names: str | None = None,
+    season: int | None = None,
+) -> Any:
+    """
+    Args:
+        league: A slug from league_list. Defaults to DEFAULT_LEAGUE when this
+            server is only ever pointed at one league.
+        player_ids: Comma-separated Sleeper player ids.
+        names: Comma-separated player names. Flexible, case-insensitive: exact
+            match first, then prefix, then substring - same lookup league_roster
+            uses for managers. An ambiguous one (e.g. "Justin" matching several
+            players) is reported in `unresolved` with its candidates, not guessed.
+        season: Defaults to the current season.
+    """
+    lid = _resolve_league(league)
+    return await _get(
+        f"/leagues/{lid}/players/compare",
+        params={"ids": player_ids, "names": names, "season": season},
+    )
+
+
+@mcp.tool(
     name="schedule_difficulty",
     annotations=READ_ONLY,
     description=(
@@ -982,7 +1021,7 @@ TOOL_NAMES = [
     "league_list",
     "league_snapshot", "league_settings", "league_roster",
     "league_draft_picks", "league_draft_board",
-    "waivers_available",
+    "waivers_available", "players_compare",
     "schedule_difficulty", "manager_schedule",
     "stats_advanced", "stats_odds", "stats_injury_report_team",
     "stats_injury_report_player", "stats_weather", "stats_stadiums",

@@ -361,6 +361,169 @@ async def available_players(
     }
 
 
+_MAX_COMPARE_PLAYERS = 20
+
+
+@app.get(
+    "/leagues/{league}/players/compare",
+    tags=["edge"],
+    dependencies=[Depends(require_api_key)],
+    summary="Real production for any list of players, rostered or not",
+)
+async def players_compare(
+    league: str = Path(description="A slug from GET /leagues."),
+    ids: str | None = Query(default=None, description="Comma-separated Sleeper player ids."),
+    names: str | None = Query(
+        default=None,
+        description=(
+            "Comma-separated player names. Flexible, case-insensitive: exact "
+            "match first, then prefix, then substring - same three-tier lookup "
+            "league_roster uses for managers."
+        ),
+    ),
+    season: int | None = Query(default=None, ge=1999, le=2100),
+) -> dict[str, Any]:
+    """The same production numbers `available` ranks free agents by - games,
+    season_total_points, season_average_points, recent_average_points -
+    generalized to any list of players, rostered or not. `available` only
+    covers the current free-agent pool, so it can't help with a trade
+    evaluation (both sides are rostered) or a live-draft comparison where
+    some options are already gone; this can.
+
+    Pass `ids`, `names`, or both - up to `_MAX_COMPARE_PLAYERS` players total,
+    to keep the response from ballooning. A player that doesn't resolve, is
+    an ambiguous name, or plays a position with no production data (only
+    QB/RB/WR/TE are covered here, same as `available`) is reported in
+    `unresolved` rather than failing the whole request.
+    """
+    requested_ids = [v.strip() for v in (ids or "").split(",") if v.strip()]
+    requested_names = [v.strip() for v in (names or "").split(",") if v.strip()]
+    if not requested_ids and not requested_names:
+        raise HTTPException(
+            status_code=400, detail="Provide at least one player via 'ids' or 'names'."
+        )
+    total_requested = len(requested_ids) + len(requested_names)
+    if total_requested > _MAX_COMPARE_PLAYERS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Up to {_MAX_COMPARE_PLAYERS} players per call; got {total_requested}. "
+                "Split the comparison into more than one call."
+            ),
+        )
+
+    await players.ensure_fresh()
+    lid = settings.league_id_for(league)
+    fetched = await client.league(lid)
+    scoring_settings = fetched.get("scoring_settings") or {}
+    target_season = season or (
+        int(fetched["season"]) if fetched.get("season") else await current_season()
+    )
+
+    wanted: dict[str, dict[str, Any]] = {}
+    unresolved: list[dict[str, Any]] = []
+
+    for pid in requested_ids:
+        resolved = players.resolve(pid)
+        if not resolved.get("resolved"):
+            unresolved.append({"query": pid, "reason": f"'{pid}' is not a known Sleeper player id."})
+            continue
+        wanted[resolved["player_id"]] = resolved
+
+    for name in requested_names:
+        match, candidates = players.find_by_query(name)
+        if match is None:
+            reason = (
+                f"'{name}' matches more than one player." if candidates
+                else f"No player matches '{name}'."
+            )
+            entry = {"query": name, "reason": reason}
+            if candidates:
+                entry["candidates"] = candidates
+            unresolved.append(entry)
+            continue
+        wanted[match] = players.resolve(match)
+
+    by_position: dict[str, list[str]] = {}
+    for pid, resolved in wanted.items():
+        position = (resolved.get("position") or "").upper()
+        if position not in _SKILL_POSITIONS:
+            unresolved.append(
+                {
+                    "query": pid,
+                    "reason": (
+                        f"{resolved.get('name')} plays "
+                        f"{position or 'an unknown position'}; only "
+                        f"{', '.join(_SKILL_POSITIONS)} have production data."
+                    ),
+                }
+            )
+            continue
+        by_position.setdefault(position, []).append(pid)
+
+    if not by_position:
+        return {
+            "season": target_season,
+            "scoring_not_applied": [],
+            "players": [],
+            "unresolved": unresolved,
+        }
+
+    payloads = await asyncio.gather(
+        *[
+            public.post(
+                f"/position-points/{p}",
+                params={"season": target_season},
+                json={"scoring_settings": scoring_settings},
+            )
+            for p in by_position
+        ]
+    )
+
+    scoring_not_applied: set[str] = set()
+    entries_by_pid: dict[str, dict[str, Any]] = {}
+    for position, payload in zip(by_position, payloads):
+        scoring_not_applied.update(payload.get("scoring_not_applied") or [])
+        still_wanted = set(by_position[position])
+        for entry in payload.get("players") or []:
+            sleeper_id = players.sleeper_id_for_gsis(entry["gsis_id"])
+            if sleeper_id in still_wanted:
+                entries_by_pid[sleeper_id] = entry
+
+    output = []
+    for pid, resolved in wanted.items():
+        entry = entries_by_pid.get(pid)
+        if entry is None:
+            if (resolved.get("position") or "").upper() in _SKILL_POSITIONS:
+                unresolved.append(
+                    {
+                        "query": pid,
+                        "reason": f"No {target_season} production found for {resolved.get('name')}.",
+                    }
+                )
+            continue
+        output.append(
+            {
+                "player_id": pid,
+                "name": resolved.get("name"),
+                "position": resolved.get("position"),
+                "nfl_team": entry.get("team") or resolved.get("nfl_team"),
+                "injury_status": resolved.get("injury_status"),
+                "games": entry.get("games"),
+                "season_total_points": entry.get("season_total_points"),
+                "season_average_points": entry.get("season_average_points"),
+                "recent_average_points": entry.get("recent_average_points"),
+            }
+        )
+
+    return {
+        "season": target_season,
+        "scoring_not_applied": sorted(scoring_not_applied),
+        "players": output,
+        "unresolved": unresolved,
+    }
+
+
 @app.get(
     "/leagues/{league}/schedule-difficulty/{manager}",
     tags=["edge"],

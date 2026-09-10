@@ -23,7 +23,7 @@ PLAYERS_RAW = {
 }
 
 
-async def fake_sleeper_get(self, url, params=None, timeout=None):
+async def fake_sleeper_get(self, url, params=None, headers=None, timeout=None):
     class Resp:
         status_code = 200
 

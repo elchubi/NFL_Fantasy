@@ -129,7 +129,7 @@ public URL instead — it works, it just sends the traffic out and back.
 
 ## The tools
 
-33 tools, one per backend endpoint. `/docs` is not exposed — it is only the OpenAPI
+34 tools, one per backend endpoint. `/docs` is not exposed — it is only the OpenAPI
 reference and nothing useful to a model.
 
 ### League
@@ -143,6 +143,7 @@ reference and nothing useful to a model.
 | `league_draft_picks` | One manager's fantasy draft, pick by pick. Not the NFL rookie draft - see `draft_class`/`draft_prospect` for that. |
 | `league_draft_board` | The whole league's fantasy draft, every team, in overall pick order. |
 | `waivers_available` | Free agents ranked by recent role trend and points under this league's own scoring rules. |
+| `players_compare` | Real production for any list of players, rostered or not - for a trade evaluation or a live-draft comparison, where `waivers_available`'s free-agents-only filter doesn't help. |
 | `schedule_difficulty` | For a roster's skill players, how stingy their next few opponents have been at that position. |
 | `manager_schedule` | Who a manager plays every week of the regular season - the fantasy matchup pairing itself, not a strength read. |
 
@@ -244,7 +245,7 @@ propagation, the token path, and the Host header check.
 ## Project layout
 
 ```
-server.py            The MCP server: 33 tools, annotations, transport wiring
+server.py            The MCP server: 34 tools, annotations, transport wiring
 backend.py           HTTP client for the REST backend; holds BACKEND_API_KEY
 entrypoint.py        Binds the platform's PORT, and IPv6 for private networking
 railway.json         Railway build and healthcheck config

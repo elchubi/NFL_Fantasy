@@ -291,3 +291,47 @@ class PlayerStore:
                 return pid
             fallback = fallback or pid
         return fallback
+
+    def find_by_query(self, query: str) -> tuple[str | None, list[dict[str, Any]]]:
+        """Flexible, case-insensitive lookup by full name for a human-typed
+        query - exact match first, then prefix, then substring. Same
+        three-tier algorithm services.find_team uses for managers.
+
+        Returns (player_id, candidates). On a clean single match, player_id
+        is set and candidates holds that one match; on no match or an
+        ambiguous one, player_id is None and candidates holds whatever
+        matched (empty if nothing did), for the caller to report.
+        """
+        needle = " ".join(str(query).strip().lower().split())
+        if not needle:
+            return None, []
+
+        def haystack(raw: dict[str, Any]) -> str:
+            return " ".join(str(raw.get("full_name", "")).lower().split())
+
+        def candidate(pid: str, raw: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "player_id": pid,
+                "name": raw.get("full_name") or pid,
+                "position": raw.get("position"),
+                "nfl_team": raw.get("team"),
+            }
+
+        exact = [(pid, raw) for pid, raw in self._players.items() if haystack(raw) == needle]
+        if len(exact) == 1:
+            return exact[0][0], [candidate(*exact[0])]
+        if len(exact) > 1:
+            return None, [candidate(pid, raw) for pid, raw in exact]
+
+        prefix = [
+            (pid, raw) for pid, raw in self._players.items() if haystack(raw).startswith(needle)
+        ]
+        if len(prefix) == 1:
+            return prefix[0][0], [candidate(*prefix[0])]
+        if len(prefix) > 1:
+            return None, [candidate(pid, raw) for pid, raw in prefix]
+
+        partial = [(pid, raw) for pid, raw in self._players.items() if needle in haystack(raw)]
+        if len(partial) == 1:
+            return partial[0][0], [candidate(*partial[0])]
+        return None, [candidate(pid, raw) for pid, raw in partial]
