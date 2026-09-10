@@ -845,6 +845,121 @@ async def manager(
     }
 
 
+async def _draft_picks_for_season(
+    lid: str, db: Database, season: int
+) -> tuple[list[dict[str, Any]], str]:
+    """One season's draft picks: the archive /backfill has walked, falling
+    back to the live current-season draft if nothing has been archived yet -
+    the same two-path behaviour /managers already uses for this exact data,
+    reused here rather than re-fetched."""
+    picks = await store.load_draft_picks(db, [season])
+    if picks:
+        return picks, "archive"
+
+    drafts = await client.drafts(lid)
+    if drafts:
+        newest = max(drafts, key=lambda d: str(d.get("season") or ""))
+        if newest.get("draft_id"):
+            return await client.draft_picks(newest["draft_id"]), "live (current season only)"
+    return [], "live (current season only)"
+
+
+@app.get(
+    "/leagues/{league}/draft-picks/{manager}",
+    tags=["edge"],
+    dependencies=[Depends(require_api_key)],
+    summary="One manager's draft, pick by pick",
+)
+async def draft_picks_for_manager(
+    league: str = Path(description="A slug from GET /leagues."),
+    manager: str = Path(description="Username, display name or team name."),
+    season: int | None = Query(default=None, ge=1999, le=2100),
+) -> dict[str, Any]:
+    """Every pick `manager` made in one season's draft, in draft order.
+
+    This is the same per-pick data /managers already aggregates into
+    `positions_taken` and `average_round_by_position` - just not rolled up,
+    for anyone who wants to see the actual picks rather than the summary.
+    """
+    await players.ensure_fresh()
+    lid = settings.league_id_for(league)
+    db = get_db(league)
+
+    fetched, users, rosters = await asyncio.gather(
+        client.league(lid), client.users(lid), client.rosters(lid)
+    )
+    teams = services.build_teams(users, rosters)
+    match = _match_team_or_404(teams, manager)
+
+    target_season = season or (
+        int(fetched["season"]) if fetched.get("season") else await current_season()
+    )
+    picks, source = await _draft_picks_for_season(lid, db, target_season)
+    mine = sorted(
+        (p for p in picks if p.get("roster_id") == match["roster_id"]),
+        key=lambda p: p.get("pick_no") or 999,
+    )
+
+    return {
+        "matched_on": manager,
+        "team": services.team_label(teams, match["roster_id"]),
+        "season": target_season,
+        "source": source,
+        "picks": [
+            {
+                "round": p.get("round"),
+                "pick_no": p.get("pick_no"),
+                "player": players.resolve(p.get("player_id")),
+            }
+            for p in mine
+        ],
+    }
+
+
+@app.get(
+    "/leagues/{league}/draft-board",
+    tags=["edge"],
+    dependencies=[Depends(require_api_key)],
+    summary="The whole league's draft, pick by pick",
+)
+async def draft_board(
+    league: str = Path(description="A slug from GET /leagues."),
+    season: int | None = Query(default=None, ge=1999, le=2100),
+) -> dict[str, Any]:
+    """Every pick from one season's draft, across every team, in overall pick
+    order - the same per-pick data behind /managers' draft aggregates, laid
+    out as the whole board rather than split per manager.
+    """
+    await players.ensure_fresh()
+    lid = settings.league_id_for(league)
+    db = get_db(league)
+
+    fetched, users, rosters = await asyncio.gather(
+        client.league(lid), client.users(lid), client.rosters(lid)
+    )
+    teams = services.build_teams(users, rosters)
+
+    target_season = season or (
+        int(fetched["season"]) if fetched.get("season") else await current_season()
+    )
+    picks, source = await _draft_picks_for_season(lid, db, target_season)
+    ordered = sorted(picks, key=lambda p: p.get("pick_no") or 999)
+
+    return {
+        "season": target_season,
+        "source": source,
+        "picks": [
+            {
+                "round": p.get("round"),
+                "pick_no": p.get("pick_no"),
+                "team": services.team_label(teams, p.get("roster_id")),
+                "player": players.resolve(p.get("player_id")),
+            }
+            for p in ordered
+        ],
+    }
+
+
 @app.get(
     "/leagues/{league}/pressure",
     tags=["edge"],

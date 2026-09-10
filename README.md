@@ -92,6 +92,8 @@ response, computed once there and reused by every league.
 | --- | --- | --- | --- |
 | `GET` | `/leagues/{league}/managers` | `seasons`, `days` | Every manager's profile: FAAB behaviour (typical bid, max ever, win rate on contested claims), which day they move, activity, draft tendencies by position and round, trade partners. Plus `league_context` to read one against the field. |
 | `GET` | `/leagues/{league}/manager/{name}` | `name`, `seasons`, `days` | One manager, with the league context. |
+| `GET` | `/leagues/{league}/draft-picks/{manager}` | `manager`, `season` | One manager's draft, pick by pick - the individual picks `/managers` already rolls up into `positions_taken` and `average_round_by_position`. |
+| `GET` | `/leagues/{league}/draft-board` | `season` | The whole league's draft, every team, in overall pick order. |
 | `GET` | `/leagues/{league}/pressure` | `week`, `horizon=3` | Who is forced to act: bye-week collisions, stacked injuries, positions with no cover. Ranked by urgency. |
 | `GET` | `/leagues/{league}/available` | `position`, `limit=25`, `season` | Free agents ranked by recent role trend and points under this league's own `scoring_settings` - not nflverse's generic PPR column. |
 | `GET` | `/leagues/{league}/schedule-difficulty/{manager}` | `manager`, `weeks_ahead=4`, `season` | For each of a roster's QB/RB/WR/TE, how many fantasy points its next opponents have allowed at that position. |
