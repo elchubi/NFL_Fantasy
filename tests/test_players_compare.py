@@ -189,12 +189,42 @@ def test_a_non_skill_position_is_reported_not_silently_dropped(client):
     assert "only QB, RB, WR, TE have production data" in body["unresolved"][0]["reason"]
 
 
-def test_a_skill_player_with_no_production_this_season_is_reported(client):
+def test_a_skill_player_with_no_stat_row_yet_is_zero_production_not_unresolved(client):
+    # Confirmed live: a player whose game this week just hasn't kicked off
+    # yet (or a bye, or an early-season injury) has no nflverse row at all -
+    # that is real, reportable information about them, not a failure to
+    # resolve them, so it belongs in `players` with games: 0, not
+    # `unresolved`.
     response = client.get("/leagues/main/players/compare?ids=5849", headers=HEADERS)
     assert response.status_code == 200
     body = response.json()
-    assert body["players"] == []
-    assert "No 2025 production found" in body["unresolved"][0]["reason"]
+    assert body["unresolved"] == []
+    assert len(body["players"]) == 1
+    murray = body["players"][0]
+    assert murray["name"] == "Kyler Murray"
+    assert murray["position"] == "QB"
+    # Same "no sample" convention public_data's own scoring.py uses: a zero
+    # total (sum of nothing), but None averages (there is no games to divide
+    # by) - not zero, which would misleadingly read as "scored zero points".
+    assert murray["games"] == 0
+    assert murray["season_total_points"] == 0.0
+    assert murray["season_average_points"] is None
+    assert murray["recent_average_points"] is None
+    # nfl_team still comes through from the player resolver even with no
+    # production row to pull it from.
+    assert murray["nfl_team"] == "ARI"
+
+
+def test_a_mix_of_played_and_not_yet_played_players_both_come_back(client):
+    # McCaffrey has a real stat row (see the client fixture); Murray doesn't.
+    # Both belong in `players`, distinguished only by their numbers.
+    response = client.get("/leagues/main/players/compare?ids=4034,5849", headers=HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["unresolved"] == []
+    by_name = {p["name"]: p for p in body["players"]}
+    assert by_name["Christian McCaffrey"]["games"] == 3
+    assert by_name["Kyler Murray"]["games"] == 0
 
 
 def test_requires_the_api_key(client):

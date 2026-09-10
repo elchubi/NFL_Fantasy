@@ -394,7 +394,11 @@ async def players_compare(
     to keep the response from ballooning. A player that doesn't resolve, is
     an ambiguous name, or plays a position with no production data (only
     QB/RB/WR/TE are covered here, same as `available`) is reported in
-    `unresolved` rather than failing the whole request.
+    `unresolved` rather than failing the whole request. A player who does
+    resolve but has no stat row yet this season (a bye, an injury, or simply
+    a game that hasn't kicked off yet) still comes back in `players`, with
+    `games: 0` and the same "no sample" convention as the rest of this API:
+    `season_total_points: 0`, the averages `null`.
     """
     requested_ids = [v.strip() for v in (ids or "").split(",") if v.strip()]
     requested_names = [v.strip() for v in (names or "").split(",") if v.strip()]
@@ -493,26 +497,24 @@ async def players_compare(
     output = []
     for pid, resolved in wanted.items():
         entry = entries_by_pid.get(pid)
-        if entry is None:
-            if (resolved.get("position") or "").upper() in _SKILL_POSITIONS:
-                unresolved.append(
-                    {
-                        "query": pid,
-                        "reason": f"No {target_season} production found for {resolved.get('name')}.",
-                    }
-                )
-            continue
+        # A skill-position player is only absent from position-points when
+        # nflverse has no stat row for them yet this season - a bye, an
+        # injury, or (this week) a game that just hasn't kicked off. That is
+        # real, reportable information about this specific player, not a
+        # failure to resolve them, so it is zero production in `players`
+        # (same "no sample" convention public_data's own scoring.py uses:
+        # season_total_points 0, the averages None) rather than `unresolved`.
         output.append(
             {
                 "player_id": pid,
                 "name": resolved.get("name"),
                 "position": resolved.get("position"),
-                "nfl_team": entry.get("team") or resolved.get("nfl_team"),
+                "nfl_team": (entry or {}).get("team") or resolved.get("nfl_team"),
                 "injury_status": resolved.get("injury_status"),
-                "games": entry.get("games"),
-                "season_total_points": entry.get("season_total_points"),
-                "season_average_points": entry.get("season_average_points"),
-                "recent_average_points": entry.get("recent_average_points"),
+                "games": entry.get("games") if entry else 0,
+                "season_total_points": entry.get("season_total_points") if entry else 0.0,
+                "season_average_points": entry.get("season_average_points") if entry else None,
+                "recent_average_points": entry.get("recent_average_points") if entry else None,
             }
         )
 
